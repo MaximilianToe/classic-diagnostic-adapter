@@ -23,11 +23,7 @@ use cda_comm_doip::{DoipDiagGateway, GatewayError};
 use cda_comm_uds::UdsManager;
 use cda_core::{DiagServiceResponseStruct, EcuManager};
 use cda_database::{FileManager, ProtoLoadConfig};
-use cda_interfaces::{
-    Protocol, TesterPresentControlMessage,
-    datatypes::{ComParams, DatabaseNamingConvention},
-    file_manager::{Chunk, ChunkType},
-};
+use cda_interfaces::{Protocol, TesterPresentControlMessage, datatypes::{ComParams, DatabaseNamingConvention}, file_manager::{Chunk, ChunkType}, DiagServiceError};
 use cda_sovd::WebServerConfig;
 use hashbrown::HashMap;
 use tokio::{
@@ -273,7 +269,7 @@ pub async fn create_uds_manager(
     databases: Arc<HashMap<String, RwLock<EcuManager>>>,
     variant_detection_receiver: mpsc::Receiver<Vec<String>>,
     tester_present_sender: mpsc::Receiver<TesterPresentControlMessage>,
-) -> Result<UdsManager<DoipDiagGateway<EcuManager>, DiagServiceResponseStruct, EcuManager>, String>
+) -> Result<UdsManager<DoipDiagGateway<EcuManager>, DiagServiceResponseStruct, EcuManager>, DiagServiceError>
 {
     UdsManager::new(
         gateway,
@@ -322,7 +318,7 @@ pub fn start_webserver(
     webserver_config: WebServerConfig,
     ecu_uds: UdsManager<DoipDiagGateway<EcuManager>, DiagServiceResponseStruct, EcuManager>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-) -> tokio::task::JoinHandle<Result<(), GatewayError>> {
+) -> tokio::task::JoinHandle<Result<(), DiagServiceError>> {
     cda_interfaces::spawn_named!("webserver", async move {
         cda_sovd::launch_webserver::<_, DiagServiceResponseStruct, _, _>(
             webserver_config,

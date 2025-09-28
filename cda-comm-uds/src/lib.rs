@@ -81,7 +81,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         ecus: Arc<HashMap<String, RwLock<T>>>,
         mut variant_detection_receiver: mpsc::Receiver<Vec<String>>,
         mut tester_present_receiver: mpsc::Receiver<TesterPresentControlMessage>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, DiagServiceError> {
         let manager = Self {
             ecus,
             gateway,
@@ -912,25 +912,24 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         &self,
         ecu_name: &str,
         service: Option<&DiagComm>,
-    ) -> Result<Vec<cda_interfaces::datatypes::SdSdg>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::SdSdg>, DiagServiceError> {
         match self.ecus.get(ecu_name) {
             Some(ecu) => {
                 let ecu = ecu.read().await;
                 ecu.sdgs(service)
-                    .map_err(|e| format!("Failed to get SDGs for ECU {ecu_name}: {e:?}"))
             }
-            None => Err("ECU not found".to_owned()),
+            None => Err(DiagServiceError::ResourceError("ECU not found".to_owned())),
         }
     }
 
     async fn get_comparams(
         &self,
         ecu: &str,
-    ) -> Result<cda_interfaces::datatypes::ComplexComParamValue, String> {
+    ) -> Result<cda_interfaces::datatypes::ComplexComParamValue, DiagServiceError> {
         let ecu = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?;
+            .ok_or_else(|| DiagServiceError::ResourceError(format!("Unknown ECU: {ecu}")))?;
         let comparams = ecu.read().await.comparams();
         Ok(comparams)
     }
@@ -942,7 +941,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         let items = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?
+            .ok_or_else(|| DiagServiceError::ResourceError(format!("Unknown ECU: {ecu}")))?
             .read()
             .await
             .get_components_data_info();
@@ -969,7 +968,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         let items = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| DiagServiceError::NotFound(format!("Unknown ECU: {ecu}")))?
+            .ok_or_else(|| DiagServiceError::ResourceError(format!("Unknown ECU: {ecu}")))?
             .read()
             .await
             .get_components_single_ecu_jobs_info();
@@ -1279,10 +1278,10 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                     "Read" => DiagCommAction::Read,
                     "Write" => DiagCommAction::Write,
                     unknown => {
-                        return Err(format!(
+                        return Err(DiagServiceError::VariantDetectionError(format!(
                             "Variant Detection for ECU {ecu_name} failed due to unknown operation \
                              type {unknown}"
-                        ));
+                        )));
                     }
                 };
 
@@ -1294,7 +1293,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                 };
                 Ok((req.to_owned(), service))
             })
-            .collect::<Result<Vec<(String, DiagComm)>, String>>()?;
+            .collect::<Result<Vec<(String, DiagComm)>, DiagServiceError>>()?;
 
         if !ecu.read().await.is_loaded() {
             ecu.write()

@@ -18,7 +18,6 @@ use doip_definitions::{
     payload::{ActivationCode, DoipPayload, RoutingActivationRequest, RoutingActivationResponse},
 };
 use cda_interfaces::DiagServiceError;
-use cda_interfaces::DiagServiceError::ConnectionClosed;
 use crate::ConnectionError;
 use crate::connections::EcuConnectionError;
 

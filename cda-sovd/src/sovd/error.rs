@@ -51,6 +51,8 @@ impl From<DiagServiceError> for ApiError {
             | DiagServiceError::DatabaseEntryNotFound(_)
             | DiagServiceError::VariantDetectionError(_)
             | DiagServiceError::EcuOffline(_)
+            | DiagServiceError::ConfigurationError(_)
+            | DiagServiceError::ResourceError(_)
             | DiagServiceError::ConnectionClosed => {
                 ApiError::InternalServerError(Some(value.to_string()))
             }

@@ -12,7 +12,6 @@
  */
 
 use std::{future::Future, sync::Arc, time::Duration};
-use std::fmt::{write, Display, Formatter};
 use cda_interfaces::{DoipComParamProvider, EcuAddressProvider, TesterPresentControlMessage};
 use doip_definitions::{
     header::PayloadType,
@@ -24,11 +23,6 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::{DoipDiagGateway, DoipTarget, connections::handle_gateway_connection, GatewayError};
 
-pub enum VAMError{
-
-}
-
-#[tracing::instrument(skip(socket, ecus, shutdown_signal), fields(gateway_port))]
 pub(crate) async fn get_vehicle_identification<T, F>(
     socket: &mut UdpSocket,
     netmask: u32,

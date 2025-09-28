@@ -18,7 +18,6 @@ use futures::future::FutureExt;
 use opensovd_cda_lib::{config::configfile::ConfigSanity, shutdown_signal};
 use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt as _;
-use cda_comm_doip::GatewayError;
 use cda_interfaces::DiagServiceError;
 
 #[derive(Parser, Debug)]
@@ -86,7 +85,8 @@ async fn main() -> Result<(), DiagServiceError> {
             config.logging.otel.endpoint
         );
         let (guard, metrics_layer, otel_layer) =
-            cda_tracing::new_otel_subscriber(&config.logging.otel)?;
+            cda_tracing::new_otel_subscriber(&config.logging.otel)
+                .map_err(|err| DiagServiceError::ResourceError(err.to_string()))?;
         layers.push(metrics_layer);
         layers.push(otel_layer);
         Some(guard)
@@ -95,14 +95,18 @@ async fn main() -> Result<(), DiagServiceError> {
     };
     let _guard = if config.logging.log_file_config.enabled {
         let (guard, file_layer) =
-            cda_tracing::new_file_subscriber(&config.logging.log_file_config)?;
+            cda_tracing::new_file_subscriber(&config.logging.log_file_config).map_err(
+                |err| DiagServiceError::ResourceError(err.to_string())
+            )?;
         layers.push(file_layer);
         Some(guard)
     } else {
         None
     };
 
-    cda_tracing::init_tracing(tracing.with(layers))?;
+    cda_tracing::init_tracing(tracing.with(layers)).map_err(
+        |err| DiagServiceError::ResourceError(err.to_string())
+    )?;
 
     tracing::info!("Starting CDA...");
 
@@ -149,7 +153,7 @@ async fn main() -> Result<(), DiagServiceError> {
         Ok(gateway) => gateway,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create diagnostic gateway");
-            return Err(e);
+            return Err(DiagServiceError::ResourceError(e.to_string()));
         }
     };
 
@@ -164,7 +168,7 @@ async fn main() -> Result<(), DiagServiceError> {
         Ok(uds) => uds,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create uds manager");
-            return Err(GatewayError::ResourceError(e));
+            return Err(e);
         }
     };
 

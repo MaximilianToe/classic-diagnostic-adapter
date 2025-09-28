@@ -30,13 +30,15 @@ const DEFAULT_LOG_FILE_PATH: &str = "/var/log/opensovd-cda";
 
 #[derive(Debug)]
 pub enum TracingError {
-   ResourceError(String)
+   ResourceError(String),
+   InitError(String)
 }
 
 impl Display for TracingError{
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self{
-            TracingError::ResourceError(msg) => write!(f, "Resource error: {msg}")
+            TracingError::ResourceError(msg) => write!(f, "Resource error: {msg}"),
+            TracingError::InitError(msg) => write!(f, "Error durcing initialization: {msg}")
         }
     }
 }
@@ -215,10 +217,10 @@ fn console_filter(meta: &tracing_core::Metadata<'_>) -> bool {
 /// Initializes the logging system for the application.
 /// # Errors
 /// Returns a string error if initialization fails.
-pub fn init_tracing<T: SubscriberInitExt>(subscriber: T) -> Result<(), String> {
+pub fn init_tracing<T: SubscriberInitExt>(subscriber: T) -> Result<(), TracingError> {
     subscriber
         .try_init()
-        .map_err(|e| format!("Failed to initialize tracing subscriber: {e}"))
+        .map_err(|e| TracingError::InitError(format!("Failed to initialize tracing subscriber: {e}")))
 }
 
 impl Default for LoggingConfig {

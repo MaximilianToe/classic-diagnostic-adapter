@@ -115,7 +115,7 @@ impl Display for GatewayError{
            GatewayError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
            GatewayError::SendError(msg) => write!(f, "Send error: {msg}"),
            GatewayError::UnexpectedResponse(msg) => write!(f, "Unexpected response: {msg}"),
-           GatewayError::ConnectionClosed(msg) => write!(f, "Connection closed"),
+           GatewayError::ConnectionClosed(msg) => write!(f, "Connection closed: {msg}"),
            GatewayError::ResourceError(msg) => write!(f, "Resource error: {msg}")
         }
     }

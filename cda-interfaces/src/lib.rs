@@ -196,6 +196,7 @@ pub enum DiagServiceError {
     Timeout,
     AccessDenied(String),
     ConfigurationError(String),
+    ResourceError(String),
     DataError(DataParseError),
 }
 
@@ -243,6 +244,7 @@ impl Display for DiagServiceError {
             DiagServiceError::Timeout => write!(f, "Timeout"),
             DiagServiceError::AccessDenied(msg) => write!(f, "Access denied: {msg}"),
             DiagServiceError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
+            DiagServiceError::ResourceError(msg) => write!(f, "Resource error: {msg}"),
             DiagServiceError::DataError(DataParseError { value, details }) => {
                 write!(f, "Data parse error: value='{value}', details='{details}'")
             }

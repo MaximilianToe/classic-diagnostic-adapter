@@ -91,7 +91,7 @@ impl ConfigSanity for Configuration {
 }
 
 impl ConfigSanity for DatabaseNamingConvention {
-    fn validate_sanity(&self) -> Result<(), ValidationError()> {
+    fn validate_sanity(&self) -> Result<(), ConfigurationError> {
         const SHORT_NAME_AFFIX_KEY: &str = "database_naming_convention.short_name_affixes";
         // Check short name affixes
         for affix in &self.short_name_affixes {
