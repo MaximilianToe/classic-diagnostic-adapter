@@ -18,6 +18,8 @@ use futures::future::FutureExt;
 use opensovd_cda_lib::{config::configfile::ConfigSanity, shutdown_signal};
 use tokio::sync::mpsc;
 use tracing_subscriber::layer::SubscriberExt as _;
+use cda_comm_doip::GatewayError;
+use cda_interfaces::DiagServiceError;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -60,14 +62,14 @@ struct AppArgs {
 
 #[tokio::main]
 #[tracing::instrument]
-async fn main() -> Result<(), String> {
+async fn main() -> Result<(), DiagServiceError> {
     let args = AppArgs::parse();
     let mut config = opensovd_cda_lib::config::load_config().unwrap_or_else(|e| {
         println!("Failed to load configuration: {e}");
         println!("Using default values");
         opensovd_cda_lib::config::default_config()
     });
-    config.validate_sanity()?;
+    config.validate_sanity().map_err(|err| DiagServiceError::ConfigurationError(err.to_string()))?;
 
     args.update_config(&mut config);
 
@@ -162,7 +164,7 @@ async fn main() -> Result<(), String> {
         Ok(uds) => uds,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create uds manager");
-            return Err(e);
+            return Err(GatewayError::ResourceError(e));
         }
     };
 

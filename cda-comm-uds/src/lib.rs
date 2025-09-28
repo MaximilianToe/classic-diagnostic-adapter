@@ -304,7 +304,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                                 continue 'read_uds_messages; // continue reading UDS frames
                             }
                             Ok(_) => {
-                                break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse);
+                                break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse("".to_string()));
                             }
                             Err(e) => {
                                 // i.e. happens when the response is a NACK
@@ -319,7 +319,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                     }
                     Ok(None) => {
                         tracing::warn!("None response received");
-                        break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse);
+                        break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse("".to_string()));
                     }
                     Err(_) => {
                         // error means the tokio::time::timeout
@@ -938,7 +938,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     async fn get_components_data_info(
         &self,
         ecu: &str,
-    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, DiagServiceError> {
         let items = self
             .ecus
             .get(ecu)
@@ -965,11 +965,11 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     async fn get_components_single_ecu_jobs_info(
         &self,
         ecu: &str,
-    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, DiagServiceError> {
         let items = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?
+            .ok_or_else(|| DiagServiceError::NotFound(format!("Unknown ECU: {ecu}")))?
             .read()
             .await
             .get_components_single_ecu_jobs_info();
@@ -1262,11 +1262,11 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     }
 
     #[tracing::instrument(skip(self), err)]
-    async fn detect_variant(&self, ecu_name: &str) -> Result<(), String> {
+    async fn detect_variant(&self, ecu_name: &str) -> Result<(), DiagServiceError> {
         let ecu = self
             .ecus
             .get(ecu_name)
-            .ok_or_else(|| format!("Unknown ECU: {ecu_name}"))?;
+            .ok_or_else(|| DiagServiceError::VariantDetectionError(format!("Unknown ECU: {ecu_name}")))?;
 
         let requests = ecu
             .read()
@@ -1300,7 +1300,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             ecu.write()
                 .await
                 .load()
-                .map_err(|e| format!("Failed to load ECU data: {e:?}"))?;
+                .map_err(|e| DiagServiceError::VariantDetectionError(format!("Failed to load ECU data: {e:?}")))?;
         }
 
         let mut service_responses = HashMap::new();
@@ -1327,16 +1327,16 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         ecu.write()
             .await
             .detect_variant(service_responses)
-            .map_err(|e| format!("Failed to detect variant: {e:?}"))?;
+            .map_err(|e| DiagServiceError::VariantDetectionError(format!("Failed to detect variant: {e:?}")))?;
 
         Ok(())
     }
 
-    async fn get_variant(&self, ecu_name: &str) -> Result<String, String> {
+    async fn get_variant(&self, ecu_name: &str) -> Result<String, DiagServiceError> {
         let ecu = self
             .ecus
             .get(ecu_name)
-            .ok_or_else(|| format!("Unknown ECU: {ecu_name}"))?;
+            .ok_or_else(|| DiagServiceError::VariantDetectionError(format!("Unknown ECU: {ecu_name}")))?;
 
         let variant = ecu
             .read()

@@ -17,7 +17,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-
+use std::fmt::Formatter;
 use cda_interfaces::{
     DiagServiceError, DoipComParamProvider, EcuAddressProvider, EcuGateway, ServicePayload,
     TesterPresentControlMessage, TransmissionParameters, UdsResponse,
@@ -25,6 +25,7 @@ use cda_interfaces::{
 use doip_definitions::payload::{DiagnosticMessage, DiagnosticMessageNack, GenericNack};
 use hashbrown::HashMap;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use crate::connections::EcuConnectionError;
 
 mod connections;
 mod ecu_connection;
@@ -65,7 +66,7 @@ struct DoipTarget {
 
 struct DoipEcu {
     sender: mpsc::Sender<DiagnosticMessage>,
-    receiver: broadcast::Receiver<Result<DiagnosticResponse, String>>,
+    receiver: broadcast::Receiver<Result<DiagnosticResponse, EcuConnectionError>>,
 }
 
 struct DoipConnection {
@@ -78,6 +79,7 @@ enum ConnectionError {
     Closed,
     Decoding(String),
     InvalidMessage(String),
+    SendFailed(String)
 }
 
 impl Display for ConnectionError {
@@ -86,9 +88,39 @@ impl Display for ConnectionError {
             ConnectionError::Closed => write!(f, "Connection closed"),
             ConnectionError::Decoding(e) => write!(f, "Decoding error: {e}"),
             ConnectionError::InvalidMessage(e) => write!(f, "Invalid message: {e}"),
+            ConnectionError::SendFailed(e) => write!(f, "Failed to send message: {e}")
         }
     }
 }
+
+#[derive(Debug)]
+pub enum GatewayError{
+    AddressError(String),
+    SocketError(String),
+    PortError(String),
+    ConfigurationError(String),
+    //TODO find better naming for this error type
+    SendError(String),
+    UnexpectedResponse(String),
+    ConnectionClosed(String),
+    ResourceError(String)
+}
+
+impl Display for GatewayError{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+           GatewayError::AddressError(msg) => write!(f,"{msg}"),
+           GatewayError::SocketError(msg) => write!(f,"Socket error: {msg}"),
+           GatewayError::PortError(msg) => write!(f, "Port error: {msg}"),
+           GatewayError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
+           GatewayError::SendError(msg) => write!(f, "Send error: {msg}"),
+           GatewayError::UnexpectedResponse(msg) => write!(f, "Unexpected response: {msg}"),
+           GatewayError::ConnectionClosed(msg) => write!(f, "Connection closed"),
+           GatewayError::ResourceError(msg) => write!(f, "Resource error: {msg}")
+        }
+    }
+}
+
 
 impl TryFrom<DiagnosticResponse> for Option<UdsResponse> {
     type Error = DiagServiceError;
@@ -133,7 +165,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
         variant_detection: mpsc::Sender<Vec<String>>,
         tester_present: mpsc::Sender<TesterPresentControlMessage>,
         shutdown_signal: F,
-    ) -> Result<Self, String>
+    ) -> Result<Self, GatewayError>
     where
         F: Future<Output = ()> + Clone + Send + 'static,
     {
@@ -343,7 +375,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
                                 // before sending anything else.
                                 try_send_uds_response(
                                     &response_sender,
-                                    Err(DiagServiceError::UnexpectedResponse),
+                                    Err(DiagServiceError::UnexpectedResponse("".to_string())),
                                 )
                                 .await;
                                 return;
@@ -462,6 +494,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
     }
 }
 
+//TODO replace string error
 fn create_netmask(tester_ip: &str, tester_subnet: &str) -> Result<u32, String> {
     let ip = tester_ip
         .parse::<std::net::Ipv4Addr>()
@@ -476,43 +509,43 @@ fn create_netmask(tester_ip: &str, tester_subnet: &str) -> Result<u32, String> {
 fn create_socket(
     tester_ip: &str,
     gateway_port: u16,
-) -> Result<doip_sockets::udp::UdpSocket, String> {
+) -> Result<doip_sockets::udp::UdpSocket, GatewayError> {
     let tester_ip = match tester_ip {
         "127.0.0.1" => "0.0.0.0",
         _ => tester_ip,
     };
     let broadcast_addr: std::net::SocketAddr = format!("{tester_ip}:{gateway_port}")
         .parse()
-        .map_err(|e| format!("DoipGateway: Failed to create broadcast addr: {e:?}"))?;
+        .map_err(|e| GatewayError::AddressError(format!("DoipGateway: Failed to create broadcast addr: {e:?}")))?;
 
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
-    .map_err(|e| format!("DoipGateway: Failed to create socket: {e:?}"))?;
+    .map_err(|e| GatewayError::SocketError(format!("DoipGateway: Failed to create socket: {e:?}")))?;
 
     socket
         .set_reuse_address(true)
-        .map_err(|e| format!("DoipGateway: Failed to set reuse address: {e:?}"))?;
+        .map_err(|e| GatewayError::AddressError(format!("DoipGateway: Failed to set reuse address: {e:?}")))?;
     #[cfg(target_family = "unix")]
     socket
         .set_reuse_port(true)
-        .map_err(|e| format!("DoipGateway: Failed to set reuse port: {e:?}"))?;
+        .map_err(|e| GatewayError::PortError(format!("DoipGateway: Failed to set reuse port: {e:?}")))?;
     socket
         .set_broadcast(true)
-        .map_err(|e| format!("DoipGateway: Failed to set broadcast flag on socket: {e:?}"))?;
+        .map_err(|e| GatewayError::SocketError(format!("DoipGateway: Failed to set broadcast flag on socket: {e:?}")))?;
     socket
         .set_nonblocking(true)
-        .map_err(|e| format!("DoipGateway: Failed to set non-blocking mode: {e:?}"))?;
+        .map_err(|e| GatewayError::ConfigurationError(format!("DoipGateway: Failed to set non-blocking mode: {e:?}")))?;
 
     socket
         .bind(&broadcast_addr.into())
-        .map_err(|e| format!("DoipGateway: Failed to bind socket: {e:?}"))?;
+        .map_err(|e| GatewayError::SocketError(format!("DoipGateway: Failed to bind socket: {e:?}")))?;
 
     let std_sock: std::net::UdpSocket = socket.into();
     doip_sockets::udp::UdpSocket::from_std(std_sock)
-        .map_err(|e| format!("DoipGateway: Failed to create DoIP socket from std socket: {e:?}"))
+        .map_err(|e| GatewayError::SocketError(format!("DoipGateway: Failed to create DoIP socket from std socket: {e:?}")))
 }
 
 impl<T: EcuAddressProvider + DoipComParamProvider> Clone for DoipDiagGateway<T> {

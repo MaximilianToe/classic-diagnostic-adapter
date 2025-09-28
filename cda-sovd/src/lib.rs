@@ -61,7 +61,7 @@ pub async fn launch_webserver<F, R, T, M>(
     flash_files_path: String,
     file_manager: HashMap<String, M>,
     shutdown_signal: F,
-) -> Result<(), String>
+) -> Result<(), GatewayError>
 where
     F: Future<Output = ()> + Send + 'static,
     R: DiagServiceResponse,

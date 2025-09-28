@@ -12,7 +12,7 @@
  */
 
 use std::{future::Future, sync::Arc, time::Duration};
-
+use std::fmt::{write, Display, Formatter};
 use cda_interfaces::{DoipComParamProvider, EcuAddressProvider, TesterPresentControlMessage};
 use doip_definitions::{
     header::PayloadType,
@@ -22,7 +22,11 @@ use doip_sockets::udp::UdpSocket;
 use hashbrown::HashMap;
 use tokio::sync::{RwLock, mpsc};
 
-use crate::{DoipDiagGateway, DoipTarget, connections::handle_gateway_connection};
+use crate::{DoipDiagGateway, DoipTarget, connections::handle_gateway_connection, GatewayError};
+
+pub enum VAMError{
+
+}
 
 #[tracing::instrument(skip(socket, ecus, shutdown_signal), fields(gateway_port))]
 pub(crate) async fn get_vehicle_identification<T, F>(
@@ -31,7 +35,7 @@ pub(crate) async fn get_vehicle_identification<T, F>(
     gateway_port: u16,
     ecus: &Arc<HashMap<String, RwLock<T>>>,
     shutdown_signal: F,
-) -> Result<Vec<DoipTarget>, String>
+) -> Result<Vec<DoipTarget>, GatewayError>
 where
     T: EcuAddressProvider,
     F: Future<Output = ()> + Clone + Send + 'static,
@@ -44,10 +48,10 @@ where
             DoipPayload::VehicleIdentificationRequest(VehicleIdentificationRequest {}),
             format!("{broadcast_ip}:{gateway_port}")
                 .parse()
-                .map_err(|_| "Invalid port")?,
+                .map_err(|_| GatewayError::SendError("Invalid port".to_string()))?,
         )
         .await
-        .map_err(|e| format!("Failed to send VIR: {e:?}"))?;
+        .map_err(|e| GatewayError::SendError(format!("Failed to send VIR: {e:?}")))?;
 
     let mut gateways = Vec::new();
 
@@ -71,8 +75,8 @@ where
                             Err(e) => tracing::error!(error = ?e, "Failed to handle VAM"),
                         }
                     }
-                    Ok(Some(Err(e))) => return Err(format!("Failed to receive VAMs: {e:?}")),
-                    Ok(None) => return Err("Gateway closed connection".to_owned()),
+                    Ok(Some(Err(e))) => return Err(GatewayError::UnexpectedResponse(format!("Failed to receive VAMs: {e:?}"))),
+                    Ok(None) => return Err(GatewayError::ConnectionClosed("Gateway closed connection".to_owned())),
                     Err(_) => {
                         // no VAM received within timeout
                         break;

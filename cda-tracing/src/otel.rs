@@ -23,6 +23,7 @@ use opentelemetry_semantic_conventions::{
     resource::{DEPLOYMENT_ENVIRONMENT_NAME, SERVICE_VERSION},
 };
 use serde::{Deserialize, Serialize};
+use crate::TracingError;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct OtelConfig {
@@ -57,13 +58,13 @@ fn resource() -> Resource {
 }
 
 // Construct MeterProvider for MetricsLayer
-fn init_meter_provider(config: &OtelConfig) -> Result<SdkMeterProvider, String> {
+fn init_meter_provider(config: &OtelConfig) -> Result<SdkMeterProvider, TracingError> {
     let exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
         .with_temporality(opentelemetry_sdk::metrics::Temporality::default())
         .with_endpoint(&config.endpoint)
         .build()
-        .map_err(|e| format!("Failed to create OTLP metric exporter: {e}"))?;
+        .map_err(|e| TracingError::ResourceError(format!("Failed to create OTLP metric exporter: {e}")))?;
 
     let reader = PeriodicReader::builder(exporter)
         .with_interval(std::time::Duration::from_secs(30))
@@ -80,12 +81,12 @@ fn init_meter_provider(config: &OtelConfig) -> Result<SdkMeterProvider, String> 
 }
 
 // Construct TracerProvider for OpenTelemetryLayer
-fn init_tracer_provider(config: &OtelConfig) -> Result<SdkTracerProvider, String> {
+fn init_tracer_provider(config: &OtelConfig) -> Result<SdkTracerProvider, TracingError> {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(&config.endpoint)
         .build()
-        .map_err(|e| format!("Failed to create OTLP span exporter: {e}"))?;
+        .map_err(|e| TracingError::ResourceError(format!("Failed to create OTLP span exporter: {e}")))?;
 
     Ok(SdkTracerProvider::builder()
         // Customize sampling strategy
@@ -100,7 +101,7 @@ fn init_tracer_provider(config: &OtelConfig) -> Result<SdkTracerProvider, String
 
 // Initialize tracing-subscriber and return OtelGuard
 // for opentelemetry-related termination processing
-pub(crate) fn init_tracing_subscriber(config: &OtelConfig) -> Result<OtelGuard, String> {
+pub(crate) fn init_tracing_subscriber(config: &OtelConfig) -> Result<OtelGuard, TracingError> {
     let tracer_provider = init_tracer_provider(config)?;
     let meter_provider = init_meter_provider(config)?;
 

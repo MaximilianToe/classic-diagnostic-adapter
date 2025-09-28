@@ -64,7 +64,7 @@ impl From<DiagServiceError> for ApiError {
             | DiagServiceError::Nack(_)
             | DiagServiceError::InvalidSession(_)
             | DiagServiceError::UnknownOperation
-            | DiagServiceError::UnexpectedResponse
+            | DiagServiceError::UnexpectedResponse(_)
             | DiagServiceError::RequestNotSupported(_)
             | DiagServiceError::Timeout
             | DiagServiceError::DataError(_)

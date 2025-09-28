@@ -17,6 +17,10 @@ use doip_definitions::{
     message::DoipMessage,
     payload::{ActivationCode, DoipPayload, RoutingActivationRequest, RoutingActivationResponse},
 };
+use cda_interfaces::DiagServiceError;
+use cda_interfaces::DiagServiceError::ConnectionClosed;
+use crate::ConnectionError;
+use crate::connections::EcuConnectionError;
 
 const ENABLED_SSL_CIPHERS: [&str; 4] = [
     "ECDHE-RSA-AES128-GCM-SHA256",
@@ -37,7 +41,7 @@ const ELIPTIC_CURVE_GROUPS: [&str; 8] = [
 ];
 
 pub(crate) trait ECUConnection {
-    async fn send(&mut self, msg: DoipPayload) -> Result<(), String>
+    async fn send(&mut self, msg: DoipPayload) -> Result<(), ConnectionError>
     where
         Self: std::borrow::Borrow<Self>;
     async fn read(&mut self) -> Option<Result<DoipMessage, doip_sockets::Error>>
@@ -57,12 +61,12 @@ pub(crate) struct EcuConnectionTarget {
 }
 
 impl ECUConnection for EcuConnectionVariant {
-    async fn send(&mut self, msg: DoipPayload) -> Result<(), String> {
+    async fn send(&mut self, msg: DoipPayload) -> Result<(), ConnectionError> {
         match self {
             EcuConnectionVariant::Tls(conn) => conn.send(msg).await,
             EcuConnectionVariant::Plain(conn) => conn.send(msg).await,
         }
-        .map_err(|e| format!("Failed to send message: {e:?}"))
+        .map_err(|e| ConnectionError::SendFailed(format!("Failed to send message: {e:?}")))
     }
 
     async fn read(&mut self) -> Option<Result<DoipMessage, doip_sockets::Error>> {
@@ -88,7 +92,7 @@ pub(crate) async fn establish_ecu_connection(
     routing_activation_request: RoutingActivationRequest,
     connect_timeout: Duration,
     routing_activation_timeout: Duration,
-) -> Result<EcuConnectionTarget, String> {
+) -> Result<EcuConnectionTarget, EcuConnectionError> {
     let mut gateway_conn: EcuConnectionVariant = match tokio::time::timeout(
         connect_timeout,
         doip_sockets::tcp::TcpStream::connect(format!("{}:{}", gateway_ip, 13400)), // unencrypted
@@ -96,8 +100,8 @@ pub(crate) async fn establish_ecu_connection(
     .await
     {
         Ok(Ok(stream)) => EcuConnectionVariant::Plain(stream),
-        Ok(Err(e)) => return Err(format!("Connect failed: {e:?}")),
-        Err(_) => return Err("Connect timed out after 10 seconds".to_owned()),
+        Ok(Err(e)) => return Err(EcuConnectionError::ConnectionError(format!("Connect failed: {e:?}"))),
+        Err(_) => return Err(EcuConnectionError::ConnectionTimeout("Connect timed out after 10 seconds".to_owned())),
     };
 
     if let Err(e) = gateway_conn
@@ -106,7 +110,7 @@ pub(crate) async fn establish_ecu_connection(
         ))
         .await
     {
-        return Err(format!("Failed to send routing activation: {e:?}"));
+        return Err(EcuConnectionError::RoutingError(format!("Failed to send routing activation: {e:?}")));
     }
 
     match try_read_routing_activation_response(
@@ -150,13 +154,13 @@ pub(crate) async fn establish_ecu_connection(
                         gateway_ip: gateway_ip.to_owned(),
                     })
                 }
-                _ => Err(format!(
+                _ => Err(EcuConnectionError::RoutingError(format!(
                     "Failed to activate routing: {:?}",
                     msg.activation_code
-                )),
+                ))),
             }
         }
-        Err(e) => Err(format!("Failed to activate routing: {e:?}")),
+        Err(e) => Err(EcuConnectionError::RoutingError(format!("Failed to activate routing: {e:?}"))),
     }
 }
 
@@ -175,7 +179,7 @@ pub(crate) async fn establish_tls_ecu_connection(
     routing_activation_request: RoutingActivationRequest,
     connnect_timeout: Duration,
     routing_activation_timeout: Duration,
-) -> Result<EcuConnectionVariant, String> {
+) -> Result<EcuConnectionVariant, EcuConnectionError> {
     let mut gateway_conn: EcuConnectionVariant = match tokio::time::timeout(
         connnect_timeout,
         doip_sockets::tcp::DoIpSslStream::connect_with_ciphers(
@@ -187,8 +191,8 @@ pub(crate) async fn establish_tls_ecu_connection(
     .await
     {
         Ok(Ok(stream)) => EcuConnectionVariant::Tls(stream),
-        Ok(Err(e)) => return Err(format!("Connect failed: {e:?}")),
-        Err(_) => return Err("Connect timed out after 10 seconds".to_owned()),
+        Ok(Err(e)) => return Err(EcuConnectionError::ConnectionError(format!("Connect failed: {e:?}"))),
+        Err(_) => return Err(EcuConnectionError::ConnectionTimeout("Connect timed out after 10 seconds".to_owned())),
     };
 
     if let Err(e) = gateway_conn
@@ -197,7 +201,7 @@ pub(crate) async fn establish_tls_ecu_connection(
         ))
         .await
     {
-        return Err(format!("Failed to send routing activation: {e:?}"));
+        return Err(EcuConnectionError::RoutingError(format!("Failed to send routing activation: {e:?}")));
     }
 
     match try_read_routing_activation_response(
@@ -210,15 +214,15 @@ pub(crate) async fn establish_tls_ecu_connection(
     {
         Ok(msg) => {
             if msg.activation_code != ActivationCode::SuccessfullyActivated {
-                return Err(format!(
+                return Err(EcuConnectionError::RoutingError(format!(
                     "Failed to activate routing: {:?}",
                     msg.activation_code
-                ));
+                )));
             }
             tracing::info!("Routing activated");
             Ok(gateway_conn) // Routing activated
         }
-        Err(e) => Err(format!("Failed to activate routing: {e:?}")),
+        Err(e) => Err(EcuConnectionError::RoutingError(format!("Failed to activate routing: {e:?}"))),
     }
 }
 
@@ -235,7 +239,7 @@ async fn try_read_routing_activation_response(
     reader: &mut impl ECUConnection,
     _gateway_name: &str,
     _gateway_ip: &str,
-) -> Result<RoutingActivationResponse, String> {
+) -> Result<RoutingActivationResponse, DiagServiceError> {
     match tokio::time::timeout(timeout, reader.read()).await {
         Ok(Some(Ok(msg))) => match msg.payload {
             DoipPayload::RoutingActivationResponse(routing_activation_response) => {
@@ -246,10 +250,10 @@ async fn try_read_routing_activation_response(
                 );
                 Ok(routing_activation_response)
             }
-            _ => Err(format!("Received non-routing activation response: {msg:?}")),
+            _ => Err(DiagServiceError::UnexpectedResponse(format!("Received non-routing activation response: {msg:?}"))),
         },
-        Ok(Some(Err(e))) => Err(format!("Error reading from gateway: {e:?}")),
-        Ok(None) => Err("Gateway closed connection".to_owned()),
-        Err(_) => Err("Timeout waiting for Routing Activation Response".to_owned()),
+        Ok(Some(Err(e))) => Err(DiagServiceError::UnexpectedResponse(format!("Error reading from gateway: {e:?}"))),
+        Ok(None) => Err(DiagServiceError::ConnectionClosed),
+        Err(_) => Err(DiagServiceError::Timeout),
     }
 }

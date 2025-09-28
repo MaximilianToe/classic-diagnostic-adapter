@@ -10,7 +10,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
+use std::fmt::{Display, Formatter};
 use opentelemetry::trace::TracerProvider;
 use serde::{Deserialize, Serialize};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -27,6 +27,19 @@ pub mod subscriber;
 
 const DEFAULT_LOG_FILE_NAME: &str = "opensovd-cda.log";
 const DEFAULT_LOG_FILE_PATH: &str = "/var/log/opensovd-cda";
+
+#[derive(Debug)]
+pub enum TracingError {
+   ResourceError(String)
+}
+
+impl Display for TracingError{
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self{
+            TracingError::ResourceError(msg) => write!(f, "Resource error: {msg}")
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct LoggingConfig {
@@ -101,13 +114,13 @@ pub fn new_term_subscriber<S: tracing_core::Subscriber + for<'a> LookupSpan<'a>>
 
 pub fn new_file_subscriber<S: tracing_core::Subscriber + for<'a> LookupSpan<'a>>(
     config: &LogFileConfig,
-) -> Result<(WorkerGuard, BoxedLayer<S>), String> {
+) -> Result<(WorkerGuard, BoxedLayer<S>), TracingError> {
     let appender = subscriber::file_log_writer(
         config.path.clone(),
         config.name.clone(),
         config.append_enabled,
     )
-    .map_err(|e| format!("failed to setup log file {e}"))?;
+    .map_err(|e| TracingError::ResourceError(format!("failed to setup log file {e}")))?;
     let (non_blocking_appender, guard) = tracing_appender::non_blocking(appender);
 
     let file_subscriber = tracing_subscriber::fmt::layer()
@@ -142,7 +155,7 @@ pub fn new_otel_subscriber<
     S: tracing_core::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
 >(
     config: &OtelConfig,
-) -> Result<(OtelGuard, BoxedLayer<S>, BoxedLayer<S>), String> {
+) -> Result<(OtelGuard, BoxedLayer<S>, BoxedLayer<S>), TracingError> {
     let guard = otel::init_tracing_subscriber(config)?;
     let tracer = guard.tracer_provider.tracer("CDA");
 
