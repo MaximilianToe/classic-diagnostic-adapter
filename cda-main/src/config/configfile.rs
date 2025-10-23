@@ -10,9 +10,9 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
-use cda_interfaces::datatypes::{
-    ComParams, DatabaseNamingConvention, DiagnosticServiceAffixPosition,
+use cda_interfaces::{
+    DiagServiceError,
+    datatypes::{ComParams, DatabaseNamingConvention, DiagnosticServiceAffixPosition},
 };
 use serde::{Deserialize, Serialize};
 
@@ -43,7 +43,7 @@ pub struct DoipConfig {
 
 pub trait ConfigSanity {
     /// Checks the configuration for common mistakes and returns an error message if found.
-    fn validate_sanity(&self) -> Result<(), String>;
+    fn validate_sanity(&self) -> Result<(), DiagServiceError>;
 }
 
 impl Default for Configuration {
@@ -69,7 +69,7 @@ impl Default for Configuration {
 }
 
 impl ConfigSanity for Configuration {
-    fn validate_sanity(&self) -> Result<(), String> {
+    fn validate_sanity(&self) -> Result<(), DiagServiceError> {
         self.database_naming_convention.validate_sanity()?;
         // Add more checks for Configuration fields here if needed
         Ok(())
@@ -77,23 +77,23 @@ impl ConfigSanity for Configuration {
 }
 
 impl ConfigSanity for DatabaseNamingConvention {
-    fn validate_sanity(&self) -> Result<(), String> {
+    fn validate_sanity(&self) -> Result<(), DiagServiceError> {
         const SHORT_NAME_AFFIX_KEY: &str = "database_naming_convention.short_name_affixes";
         // Check short name affixes
         for affix in &self.short_name_affixes {
             match self.short_name_affix_position {
                 DiagnosticServiceAffixPosition::Prefix => {
                     if affix.starts_with(' ') {
-                        return Err(format!(
+                        return Err(DiagServiceError::ConfigurationError(format!(
                             "{SHORT_NAME_AFFIX_KEY}: '{affix}' has leading whitespace"
-                        ));
+                        )));
                     }
                 }
                 DiagnosticServiceAffixPosition::Suffix => {
                     if affix.ends_with(' ') {
-                        return Err(format!(
+                        return Err(DiagServiceError::ConfigurationError(format!(
                             "{SHORT_NAME_AFFIX_KEY}: '{affix}' has trailing whitespace"
-                        ));
+                        )));
                     }
                 }
             }
@@ -104,16 +104,16 @@ impl ConfigSanity for DatabaseNamingConvention {
             match self.long_name_affix_position {
                 DiagnosticServiceAffixPosition::Prefix => {
                     if affix.starts_with(' ') {
-                        return Err(format!(
+                        return Err(DiagServiceError::ConfigurationError(format!(
                             "{LONG_NAME_AFFIX_KEY}: '{affix}' has leading whitespace"
-                        ));
+                        )));
                     }
                 }
                 DiagnosticServiceAffixPosition::Suffix => {
                     if affix.ends_with(' ') {
-                        return Err(format!(
+                        return Err(DiagServiceError::ConfigurationError(format!(
                             "{LONG_NAME_AFFIX_KEY}: '{affix}' has trailing whitespace"
-                        ));
+                        )));
                     }
                 }
             }
@@ -162,7 +162,7 @@ long_name_affixes = [ "Read ", "Write " ]
         let figment = Figment::from(Serialized::defaults(Configuration::default()))
             .merge(Toml::string(config_str));
         let config: Configuration = figment.extract()?;
-        config.validate_sanity()?;
+        config.validate_sanity().map_err(|err| err.to_string())?;
         assert_eq!(
             config
                 .com_params

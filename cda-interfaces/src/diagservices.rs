@@ -54,7 +54,7 @@ pub trait DiagServiceResponse: Sized + Send + Sync + 'static {
     fn response_type(&self) -> DiagServiceResponseType;
     fn get_raw(&self) -> &[u8];
     fn into_json(self) -> Result<DiagServiceJsonResponse, DiagServiceError>;
-    fn as_nrc(&self) -> Result<MappedNRC, String>;
+    fn as_nrc(&self) -> Result<MappedNRC, DiagServiceError>;
 
     /// Extract data trouble codes from the response, if any.
     fn get_dtcs(&self) -> Result<Vec<(DtcField, DtcRecord)>, DiagServiceError>;

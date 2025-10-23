@@ -231,7 +231,7 @@ pub(crate) mod comparams {
                     Ok(v) => v.into_sovd(),
                     Err(e) => {
                         return ErrorWrapper {
-                            error: ApiError::BadRequest(e),
+                            error: ApiError::BadRequest(e.to_string()),
                             include_schema,
                         }
                         .into_response();
