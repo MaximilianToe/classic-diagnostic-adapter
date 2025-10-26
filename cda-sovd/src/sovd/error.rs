@@ -52,6 +52,7 @@ impl From<DiagServiceError> for ApiError {
             | DiagServiceError::VariantDetectionError(_)
             | DiagServiceError::EcuOffline(_)
             | DiagServiceError::ConfigurationError(_)
+            | DiagServiceError::SetupError(_)
             | DiagServiceError::ResourceError(_)
             | DiagServiceError::ConnectionClosed => {
                 ApiError::InternalServerError(Some(value.to_string()))
@@ -59,6 +60,7 @@ impl From<DiagServiceError> for ApiError {
 
             DiagServiceError::InvalidRequest(_)
             | DiagServiceError::SendFailed(_)
+            | DiagServiceError::InvalidAddress(_)
             | DiagServiceError::ParameterConversionError(_)
             | DiagServiceError::BadPayload(_)
             | DiagServiceError::NotEnoughData { .. }

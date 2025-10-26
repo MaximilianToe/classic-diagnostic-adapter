@@ -516,7 +516,7 @@ fn get_dop_variant(
                 .physical_type
                 .as_ref()
                 .map(|p| {
-                    Ok(PhysicalType {
+                    Ok::<PhysicalType, DiagServiceError>(PhysicalType {
                         precision: p.precision(),
                         base_data_type: p.base_data_type.try_into()?,
                         display_radix: if let Some(radix) = p.display_radix {
@@ -586,7 +586,7 @@ fn get_dop_variant(
                     .switch_key
                     .as_ref()
                     .map(|s| {
-                        Ok(SwitchKey {
+                        Ok::<SwitchKey, DiagServiceError>(SwitchKey {
                             byte_position: s.byte_position,
                             bit_position: s.bit_position(),
                             dop: s
