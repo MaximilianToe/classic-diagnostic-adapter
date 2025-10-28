@@ -19,6 +19,7 @@ path = "src/lib.rs"
 cda-interfaces = { workspace = true }
 cda-plugin-security = { workspace = true }
 sovd-interfaces = { workspace = true }
+cda-comm-doip = { workspace = true }
 
 tokio = { workspace = true, features = ["net"] }
 futures = { workspace = true }                         # external
