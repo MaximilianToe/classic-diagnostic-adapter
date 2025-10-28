@@ -24,7 +24,7 @@ use cda_comm_uds::UdsManager;
 use cda_core::{DiagServiceResponseStruct, EcuManager};
 use cda_database::{FileManager, ProtoLoadConfig};
 use cda_interfaces::{
-    Protocol, TesterPresentControlMessage,
+    DiagServiceError, DoipGatewaySetupError, Protocol, TesterPresentControlMessage,
     datatypes::{ComParams, DatabaseNamingConvention},
     file_manager::{Chunk, ChunkType},
 };
@@ -278,7 +278,7 @@ pub async fn create_uds_manager<S: SecurityPlugin>(
     databases: Arc<HashMap<String, RwLock<EcuManager<S>>>>,
     variant_detection_receiver: mpsc::Receiver<Vec<String>>,
     tester_present_sender: mpsc::Receiver<TesterPresentControlMessage>,
-) -> Result<UdsManagerType<S>, String> {
+) -> Result<UdsManagerType<S>, DiagServiceError> {
     UdsManager::new(
         gateway,
         databases,
@@ -303,7 +303,7 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
     variant_detection: mpsc::Sender<Vec<String>>,
     tester_present: mpsc::Sender<TesterPresentControlMessage>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + Clone + 'static,
-) -> Result<DoipDiagGateway<EcuManager<S>>, String> {
+) -> Result<DoipDiagGateway<EcuManager<S>>, DoipGatewaySetupError> {
     DoipDiagGateway::new(
         doip_tester_address,
         doip_tester_subnet,
@@ -326,7 +326,7 @@ pub fn start_webserver<S: SecurityPlugin>(
     webserver_config: WebServerConfig,
     ecu_uds: UdsManager<DoipDiagGateway<EcuManager<S>>, DiagServiceResponseStruct, EcuManager<S>>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-) -> tokio::task::JoinHandle<Result<(), String>> {
+) -> tokio::task::JoinHandle<Result<(), DoipGatewaySetupError>> {
     cda_interfaces::spawn_named!("webserver", async move {
         cda_sovd::launch_webserver::<_, DiagServiceResponseStruct, _, _, DefaultSecurityPlugin>(
             webserver_config,
