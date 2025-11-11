@@ -329,13 +329,13 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .as_ref()
             .and_then(|v| self.ecu_data.variants.get(&v.id))
             .or_else(|| self.ecu_data.variants.get(&self.ecu_data.base_variant_id))
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         let base_variant = self
             .ecu_data
             .variants
             .get(&self.ecu_data.base_variant_id)
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         // iterate through the services and for each service, resolve the parameters
         // sort the parameters by byte_pos & bit_pos, and take the first parameter
@@ -418,7 +418,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     None
                 }
             })
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         Self::check_security_plugin(security_plugin, mapped_service)?;
 
@@ -743,7 +743,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     .and_then(|variant| variant.single_ecu_job_lookup.get(job_name))
             })
             .or(self.ecu_data.base_single_ecu_job_lookup.get(job_name))
-            .ok_or(DiagServiceError::NotFound)
+            .ok_or(DiagServiceError::NotFound(None))
             .and_then(|id| {
                 self.ecu_data
                     .single_ecu_jobs
@@ -751,7 +751,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     .ok_or_else(|| {
                         // this should not happen, there should always be a base variant.
                         tracing::warn!("Job reference could not be resolved to a job");
-                        DiagServiceError::NotFound
+                        DiagServiceError::NotFound(None)
                     })
                     .map(std::convert::Into::into)
             })
@@ -768,11 +768,11 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
         self.ecu_data
             .functional_classes_lookup
             .get(func_class_name)
-            .ok_or(DiagServiceError::NotFound)
+            .ok_or(DiagServiceError::NotFound(None))
             .and_then(|fc| {
                 fc.services
                     .get(&u32::from(service_id))
-                    .ok_or(DiagServiceError::NotFound)
+                    .ok_or(DiagServiceError::NotFound(None))
                     .map(std::convert::Into::into)
             })
     }
@@ -879,13 +879,13 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .map(|(_, state)| state)
             .ok_or_else(|| {
                 tracing::warn!(session = %session, "Session not found in state chart");
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         let session = self.access_control.lock().session;
         let current_session = session_state_chart.states.get(&session).ok_or_else(|| {
             tracing::error!(current_session = %session, "Current session does not exist");
-            DiagServiceError::NotFound
+            DiagServiceError::NotFound(None)
         })?;
 
         let session_service_id = current_session
@@ -899,7 +899,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     available_transitions = ?current_session.transitions,
                     "No transition from current session to target session exists"
                 );
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         let session_service = self
@@ -911,7 +911,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     session_service_id = %session_service_id,
                     "Session service not found in ECU data"
                 );
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         let name = STRINGS.get(session_service.short_name).ok_or_else(|| {
@@ -919,7 +919,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                 session_service_id = %session_service_id,
                 "Session service has no short name"
             );
-            DiagServiceError::NotFound
+            DiagServiceError::NotFound(None)
         })?;
 
         Ok((
@@ -954,7 +954,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .map(|(_, state)| state)
             .ok_or_else(|| {
                 tracing::warn!(security_level = %level, "Security access not found in state chart");
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         let current_access = security_state_chart
@@ -965,7 +965,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     current_security_state = %session_control.security,
                     "Current security access state does not exist"
                 );
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         let security_service_id = current_access
@@ -979,7 +979,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     available_transitions = ?current_access.transitions,
                     "No transition from current access to target level exists"
                 );
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
         if has_key {
@@ -993,7 +993,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                         security_service_id = %security_service_id,
                         "Security service not found in ECU data"
                     );
-                    DiagServiceError::NotFound
+                    DiagServiceError::NotFound(None)
                 })?;
 
             let name = STRINGS.get(security_service.short_name).ok_or_else(|| {
@@ -1001,7 +1001,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                     security_service_id = %security_service_id,
                     "Security service has no short name"
                 );
-                DiagServiceError::NotFound
+                DiagServiceError::NotFound(None)
             })?;
 
             Ok(SecurityAccess::SendKey((
@@ -1039,7 +1039,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                 })
                 .ok_or_else(|| {
                     tracing::warn!("Security service not found in ECU data");
-                    DiagServiceError::NotFound
+                    DiagServiceError::NotFound(None)
                 })?;
             Ok(SecurityAccess::RequestSeed(DiagComm {
                 name: seed_service_name.clone(),
@@ -1085,7 +1085,7 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
                 name.to_lowercase() == self.database_naming_convention.functional_class_varcoding
             })
             .map(|(&id, _)| id)
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         let configuration_sids = [
             service_ids::READ_DATA_BY_IDENTIFIER,
@@ -1097,13 +1097,13 @@ impl<S: SecurityPlugin> cda_interfaces::EcuManager for EcuManager<S> {
             .as_ref()
             .and_then(|v| self.ecu_data.variants.get(&v.id))
             .or_else(|| self.ecu_data.variants.get(&self.ecu_data.base_variant_id))
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         let base_variant = self
             .ecu_data
             .variants
             .get(&self.ecu_data.base_variant_id)
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         // Maps a common abbreviated service short name (using the configured affixes) to
         // a vector of bytes of: service_id, ID_parameter_coded_const
@@ -1642,13 +1642,15 @@ impl<S: SecurityPlugin> EcuManager<S> {
                     .find_map(|(_, variant)| variant.service_lookup.get(&lookup_name))
             });
 
-        let service = lookup.ok_or(DiagServiceError::NotFound).and_then(|id| {
-            self.ecu_data.services.get(id).ok_or_else(|| {
-                // this should not happen, there should always be a base variant.
-                tracing::warn!("Service reference could not be resolved to a service");
-                DiagServiceError::NotFound
-            })
-        })?;
+        let service = lookup
+            .ok_or(DiagServiceError::NotFound(None))
+            .and_then(|id| {
+                self.ecu_data.services.get(id).ok_or_else(|| {
+                    // this should not happen, there should always be a base variant.
+                    tracing::warn!("Service reference could not be resolved to a service");
+                    DiagServiceError::NotFound(None)
+                })
+            })?;
 
         if !diag_comm
             .type_
@@ -1660,7 +1662,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 expected_prefix = ?diag_comm.type_.service_prefix(),
                 "Service ID prefix mismatch"
             );
-            return Err(DiagServiceError::NotFound);
+            return Err(DiagServiceError::NotFound(None));
         }
 
         Ok(service)
@@ -2616,7 +2618,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
             .or_else(|| self.ecu_data.base_state_chart_lookup.get(semantic))
             .or_else(|| self.ecu_data.state_chart_lookup.get(semantic))
             .and_then(|state_chart_id| self.ecu_data.state_charts.get(state_chart_id))
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
         Ok(state_chart)
     }
     fn default_state(&self, semantic: &str) -> Result<cda_interfaces::Id, DiagServiceError> {
@@ -2801,13 +2803,13 @@ impl<S: SecurityPlugin> EcuManager<S> {
             .as_ref()
             .and_then(|v| self.ecu_data.variants.get(&v.id))
             .or_else(|| self.ecu_data.variants.get(&self.ecu_data.base_variant_id))
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         let base_variant = self
             .ecu_data
             .variants
             .get(&self.ecu_data.base_variant_id)
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         let service_ids = variant.services.iter().chain(base_variant.services.iter());
         let services = service_ids

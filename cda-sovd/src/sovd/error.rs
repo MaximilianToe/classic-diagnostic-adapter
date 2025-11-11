@@ -44,19 +44,24 @@ pub enum ApiError {
 impl From<DiagServiceError> for ApiError {
     fn from(value: DiagServiceError) -> Self {
         match &value {
-            DiagServiceError::UdsLookupError(_) => ApiError::NotFound(Some(value.to_string())),
-            DiagServiceError::NotFound => ApiError::NotFound(None),
+            DiagServiceError::UdsLookupError(_)
+            | DiagServiceError::NotFound(Some(_))
+            | DiagServiceError::NotFound(None) => ApiError::NotFound(Some(value.to_string())),
 
             DiagServiceError::InvalidDatabase(_)
             | DiagServiceError::DatabaseEntryNotFound(_)
             | DiagServiceError::VariantDetectionError(_)
             | DiagServiceError::EcuOffline(_)
+            | DiagServiceError::ConfigurationError(_)
+            | DiagServiceError::SetupError(_)
+            | DiagServiceError::ResourceError(_)
             | DiagServiceError::ConnectionClosed => {
                 ApiError::InternalServerError(Some(value.to_string()))
             }
 
             DiagServiceError::InvalidRequest(_)
             | DiagServiceError::SendFailed(_)
+            | DiagServiceError::InvalidAddress(_)
             | DiagServiceError::ParameterConversionError(_)
             | DiagServiceError::BadPayload(_)
             | DiagServiceError::NotEnoughData { .. }
@@ -64,11 +69,12 @@ impl From<DiagServiceError> for ApiError {
             | DiagServiceError::Nack(_)
             | DiagServiceError::InvalidSession(_)
             | DiagServiceError::UnknownOperation
-            | DiagServiceError::UnexpectedResponse
+            | DiagServiceError::UnexpectedResponse(_)
             | DiagServiceError::RequestNotSupported(_)
             | DiagServiceError::Timeout
             | DiagServiceError::DataError(_)
             | DiagServiceError::AccessDenied(_) => ApiError::BadRequest(value.to_string()),
+
             DiagServiceError::InvalidSecurityPlugin => {
                 ApiError::InternalServerError(Some(value.to_string()))
             }

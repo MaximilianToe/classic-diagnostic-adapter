@@ -399,6 +399,7 @@ dependencies = [
  "hashbrown 0.15.4",
  "openssl",
  "socket2",
+ "thiserror 2.0.16",
  "tokio",
  "tracing",
 ]
@@ -455,6 +456,7 @@ dependencies = [
 name = "cda-interfaces"
 version = "0.1.0"
 dependencies = [
+ "cda-tracing",
  "deepsize",
  "hashbrown 0.15.4",
  "hex",
@@ -464,6 +466,7 @@ dependencies = [
  "serde_json",
  "strum",
  "strum_macros",
+ "thiserror 2.0.16",
  "tokio",
  "tracing",
 ]
@@ -497,6 +500,7 @@ dependencies = [
  "async-trait",
  "axum 0.8.4",
  "axum-extra",
+ "cda-comm-doip",
  "cda-interfaces",
  "cda-plugin-security",
  "chrono",
@@ -534,6 +538,7 @@ dependencies = [
  "opentelemetry_sdk",
  "serde",
  "strip-ansi-escapes",
+ "thiserror 2.0.16",
  "tokio",
  "tracing",
  "tracing-appender",
@@ -1838,6 +1843,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strip-ansi-escapes",
+ "thiserror 2.0.16",
  "tokio",
  "tracing",
  "tracing-appender",
