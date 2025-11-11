@@ -24,11 +24,11 @@ use cda_comm_uds::UdsManager;
 use cda_core::{DiagServiceResponseStruct, EcuManager};
 use cda_database::{FileManager, ProtoLoadConfig};
 use cda_interfaces::{
-    Protocol, TesterPresentControlMessage,
-    datatypes::{ComParams, DatabaseNamingConvention},
+    DoipGatewaySetupError, Protocol,
+    datatypes::{ComParams, DatabaseNamingConvention, FlatbBufConfig},
     file_manager::{Chunk, ChunkType},
 };
-use cda_plugin_security::{DefaultSecurityPlugin, SecurityPlugin};
+use cda_plugin_security::{SecurityPlugin, SecurityPluginLoader};
 use cda_sovd::WebServerConfig;
 use hashbrown::HashMap;
 use tokio::{
@@ -54,6 +54,7 @@ pub async fn load_databases<S: SecurityPlugin>(
     protocol: Protocol,
     com_params: ComParams,
     database_naming_convention: DatabaseNamingConvention,
+    flat_buf_settings: FlatbBufConfig,
 ) -> (DatabaseMap<S>, FileManagerMap) {
     let databases: Arc<RwLock<HashMap<String, EcuManager<S>>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -100,6 +101,7 @@ pub async fn load_databases<S: SecurityPlugin>(
             let database_count = Arc::clone(&databases_count);
             let com_params = Arc::clone(&com_params);
             let database_naming_convention = database_naming_convention.clone();
+            let flat_buf_settings = flat_buf_settings.clone();
 
             database_load_futures.push(cda_interfaces::spawn_named!(
                 &format!("load-database-{i}"),
@@ -112,6 +114,7 @@ pub async fn load_databases<S: SecurityPlugin>(
                         database_count,
                         com_params,
                         database_naming_convention,
+                        flat_buf_settings,
                     )
                     .await;
                 }
@@ -138,14 +141,14 @@ pub async fn load_databases<S: SecurityPlugin>(
         .write()
         .await
         .drain()
-        .map(|(k, v)| (k.to_lowercase().to_string(), RwLock::new(v)))
+        .map(|(k, v)| (k.to_lowercase().clone(), RwLock::new(v)))
         .collect::<HashMap<String, RwLock<EcuManager<S>>>>();
 
     let file_managers = file_managers
         .write()
         .await
         .drain()
-        .map(|(k, v)| (k.to_lowercase().to_string(), v))
+        .map(|(k, v)| (k.to_lowercase().clone(), v))
         .collect::<HashMap<String, FileManager>>();
 
     tracing::info!(database_count = %databases_count.load(Ordering::Relaxed), duration = ?{end - start}, "Loaded databases");
@@ -157,6 +160,7 @@ pub async fn load_databases<S: SecurityPlugin>(
     (databases, file_managers)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(paths_count = paths.len()))]
 async fn load_database<S: SecurityPlugin>(
     protocol: Protocol,
@@ -166,6 +170,7 @@ async fn load_database<S: SecurityPlugin>(
     database_count: Arc<AtomicUsize>,
     com_params: Arc<ComParams>,
     database_naming_convention: DatabaseNamingConvention,
+    flat_buf_settings: FlatbBufConfig,
 ) {
     for (mddfile, _) in paths {
         match cda_database::load_proto_data(
@@ -210,7 +215,8 @@ async fn load_database<S: SecurityPlugin>(
 
                 let diag_data_base = match cda_database::datatypes::DiagnosticDatabase::new(
                     mddfile.to_str().unwrap().to_owned(),
-                    &ecu_payload,
+                    ecu_payload,
+                    flat_buf_settings.clone(),
                 ) {
                     Ok(db) => db,
                     Err(e) => {
@@ -272,27 +278,21 @@ async fn load_database<S: SecurityPlugin>(
 type UdsManagerType<S> =
     UdsManager<DoipDiagGateway<EcuManager<S>>, DiagServiceResponseStruct, EcuManager<S>>;
 
+/// Creates a new UDS manager for the webserver.
 #[tracing::instrument(skip_all, fields(database_count = databases.len()))]
-pub async fn create_uds_manager<S: SecurityPlugin>(
+pub fn create_uds_manager<S: SecurityPlugin>(
     gateway: DoipDiagGateway<EcuManager<S>>,
     databases: Arc<HashMap<String, RwLock<EcuManager<S>>>>,
     variant_detection_receiver: mpsc::Receiver<Vec<String>>,
-    tester_present_sender: mpsc::Receiver<TesterPresentControlMessage>,
-) -> Result<UdsManagerType<S>, String> {
-    UdsManager::new(
-        gateway,
-        databases,
-        variant_detection_receiver,
-        tester_present_sender,
-    )
-    .await
+) -> UdsManagerType<S> {
+    UdsManager::new(gateway, databases, variant_detection_receiver)
 }
 
 /// Creates a new diagnostic gateway for the webserver.
 /// # Errors
 /// Returns a string error if the gateway cannot be initialized.
 #[tracing::instrument(
-    skip(databases, variant_detection, tester_present, shutdown_signal),
+    skip(databases, variant_detection, shutdown_signal),
     fields(database_count = databases.len())
 )]
 pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
@@ -301,16 +301,14 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
     doip_tester_subnet: &str,
     doip_gateway_port: u16,
     variant_detection: mpsc::Sender<Vec<String>>,
-    tester_present: mpsc::Sender<TesterPresentControlMessage>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + Clone + 'static,
-) -> Result<DoipDiagGateway<EcuManager<S>>, String> {
+) -> Result<DoipDiagGateway<EcuManager<S>>, DoipGatewaySetupError> {
     DoipDiagGateway::new(
         doip_tester_address,
         doip_tester_subnet,
         doip_gateway_port,
         databases,
         variant_detection,
-        tester_present,
         shutdown_signal,
     )
     .await
@@ -320,15 +318,15 @@ pub async fn create_diagnostic_gateway<S: SecurityPlugin>(
     skip(file_managers, webserver_config, ecu_uds, shutdown_signal),
     fields(file_manager_count = file_managers.len())
 )]
-pub fn start_webserver<S: SecurityPlugin>(
+pub fn start_webserver<S: SecurityPlugin, L: SecurityPluginLoader>(
     flash_files_path: String,
     file_managers: HashMap<String, FileManager>,
     webserver_config: WebServerConfig,
     ecu_uds: UdsManager<DoipDiagGateway<EcuManager<S>>, DiagServiceResponseStruct, EcuManager<S>>,
     shutdown_signal: impl std::future::Future<Output = ()> + Send + 'static,
-) -> tokio::task::JoinHandle<Result<(), String>> {
+) -> tokio::task::JoinHandle<Result<(), DoipGatewaySetupError>> {
     cda_interfaces::spawn_named!("webserver", async move {
-        cda_sovd::launch_webserver::<_, DiagServiceResponseStruct, _, _, DefaultSecurityPlugin>(
+        cda_sovd::launch_webserver::<_, DiagServiceResponseStruct, _, _, L>(
             webserver_config,
             ecu_uds,
             flash_files_path,

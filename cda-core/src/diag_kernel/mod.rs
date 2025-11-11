@@ -13,8 +13,11 @@
 
 use std::fmt::Debug;
 
-use cda_database::datatypes::{DataType, IntervalType, Limit};
-use cda_interfaces::{DiagServiceError, Protocol, STRINGS};
+use cda_database::{
+    datatypes,
+    datatypes::{DataType, IntervalType, Limit},
+};
+use cda_interfaces::DiagServiceError;
 use hashbrown::HashMap;
 use serde::{Serialize, Serializer};
 
@@ -68,7 +71,7 @@ impl DiagDataValue {
     }
 
     fn from_number<T: num_traits::ToPrimitive + num_traits::ToBytes + ToString + Debug>(
-        value: T,
+        value: &T,
         diag_type: DataType,
     ) -> Result<Self, DiagServiceError> {
         match diag_type {
@@ -137,8 +140,8 @@ impl DiagDataValue {
                 // Determine max length for padding
                 let max_len = [
                     v.len(),
-                    upper_bytes.as_ref().map_or(0, |u| u.len()),
-                    lower_bytes.as_ref().map_or(0, |l| l.len()),
+                    upper_bytes.as_ref().map_or(0, std::vec::Vec::len),
+                    lower_bytes.as_ref().map_or(0, std::vec::Vec::len),
                 ]
                 .into_iter()
                 .max()
@@ -200,19 +203,25 @@ impl TryInto<u32> for DiagDataValue {
             }),
             DiagDataValue::UInt32(i) => Ok(i),
             DiagDataValue::Float32(f) => {
-                if f < 0.0 || f > (u32::MAX as f32) {
+                if f < 0.0 || f64::from(f) > f64::from(u32::MAX) {
                     return Err(DiagServiceError::ParameterConversionError(
                         "Float32 value out of u32 range".to_owned(),
                     ));
                 }
+                // validated above, safe to cast
+                #[allow(clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_sign_loss)]
                 Ok(f as u32)
             }
             DiagDataValue::Float64(f) => {
-                if f < 0.0 || f > (u32::MAX as f64) {
+                if f < 0.0 || f > f64::from(u32::MAX) {
                     return Err(DiagServiceError::ParameterConversionError(
                         "Float64 value out of u32 range".to_owned(),
                     ));
                 }
+                // validated above, safe to cast
+                #[allow(clippy::cast_possible_truncation)]
+                #[allow(clippy::cast_sign_loss)]
                 Ok(f as u32)
             }
             _ => Err(DiagServiceError::ParameterConversionError(
@@ -222,17 +231,29 @@ impl TryInto<u32> for DiagDataValue {
     }
 }
 
-#[derive(Clone)]
-pub struct Variant {
-    pub name: String,
-    pub(crate) id: u32,
-}
+pub fn into_db_protocol(
+    database: &datatypes::DiagnosticDatabase,
+    protocol: cda_interfaces::Protocol,
+) -> Result<datatypes::Protocol<'_>, DiagServiceError> {
+    let protocol = database
+        .diag_layers()?
+        .iter()
+        .flat_map(|dl| dl.com_param_refs().into_iter().flatten())
+        .filter_map(|cp_ref| cp_ref.protocol())
+        .find(|p| {
+            p.diag_layer()
+                .and_then(|dl| dl.short_name())
+                .is_some_and(|sn| sn == protocol.value())
+        })
+        .map(datatypes::Protocol)
+        .ok_or_else(|| {
+            DiagServiceError::InvalidDatabase(format!(
+                "Protocol {} not found in database",
+                protocol.value()
+            ))
+        })?;
 
-#[must_use]
-pub fn into_db_protocol(val: Protocol) -> cda_database::datatypes::Protocol {
-    cda_database::datatypes::Protocol {
-        short_name: STRINGS.get_or_insert(val.value()),
-    }
+    Ok(protocol)
 }
 
 impl Serialize for DiagDataValue {

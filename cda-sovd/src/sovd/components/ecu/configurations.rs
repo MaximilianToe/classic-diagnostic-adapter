@@ -47,7 +47,7 @@ pub(crate) async fn get<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManage
             let sovd_component_configuration = sovd_configurations::get::Response {
                 items: items
                     .drain(0..)
-                    .map(|c| c.into_sovd())
+                    .map(crate::sovd::IntoSovd::into_sovd)
                     .collect::<Vec<sovd_configurations::ComponentItem>>(),
                 schema,
             };
@@ -90,8 +90,11 @@ impl IntoSovd for ComponentConfigurationsInfo {
                 .map(|service_abstract| {
                     service_abstract
                         .iter()
-                        .map(|byte| format!("{byte:02X}"))
-                        .collect()
+                        .fold(String::new(), |mut acc, byte| {
+                            use std::fmt::Write;
+                            write!(&mut acc, "{byte:02X}").unwrap();
+                            acc
+                        })
                 })
                 .collect(),
         }
@@ -107,8 +110,8 @@ pub(crate) mod diag_service {
     };
     use axum_extra::extract::WithRejection;
     use cda_interfaces::{
-        DiagComm, DiagCommAction, DiagCommType, SchemaProvider, UdsEcu,
-        diagservices::DiagServiceResponse, file_manager::FileManager,
+        DiagComm, DiagCommType, SchemaProvider, UdsEcu, diagservices::DiagServiceResponse,
+        file_manager::FileManager,
     };
     use cda_plugin_security::Secured;
     use http::HeaderMap;
@@ -151,7 +154,6 @@ pub(crate) mod diag_service {
         data_request::<T>(
             DiagComm {
                 name: service.clone(),
-                action: DiagCommAction::Write,
                 type_: DiagCommType::Configurations,
                 lookup_name: None,
             },

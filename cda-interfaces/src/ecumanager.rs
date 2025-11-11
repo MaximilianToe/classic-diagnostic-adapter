@@ -16,7 +16,7 @@ use std::time::Duration;
 use hashbrown::{HashMap, HashSet};
 
 use crate::{
-    DiagComm, DiagServiceError, DoipComParamProvider, DynamicPlugin, EcuSchemaProvider, Id,
+    DiagComm, DiagServiceError, DoipComParamProvider, DynamicPlugin, EcuSchemaProvider,
     SecurityAccess, UdsComParamProvider,
     datatypes::{
         ComplexComParamValue, ComponentConfigurationsInfo, ComponentDataInfo, DtcLookup,
@@ -44,8 +44,8 @@ pub struct ServicePayload {
     pub data: Vec<u8>,
     pub source_address: u16,
     pub target_address: u16,
-    pub new_session_id: Option<Id>,
-    pub new_security_access_id: Option<Id>,
+    pub new_session: Option<String>,
+    pub new_security: Option<String>,
 }
 
 /// Trait to provide communication parameters for an ECU.
@@ -86,6 +86,9 @@ pub trait EcuManager:
     #[must_use]
     fn is_loaded(&self) -> bool;
 
+    #[must_use]
+    fn functional_groups(&self) -> Vec<String>;
+
     /// This allows to (re)load a database after unloading it during runtime, which could happen
     /// if initially the ECU wasn´t responding but later another request
     /// for reprobing the ECU happens.
@@ -97,11 +100,17 @@ pub trait EcuManager:
     fn detect_variant<T: DiagServiceResponse + Sized>(
         &mut self,
         service_responses: HashMap<String, T>,
-    ) -> Result<(), DiagServiceError>;
+    ) -> impl Future<Output = Result<(), DiagServiceError>> + Send;
     fn get_variant_detection_requests(&self) -> &HashSet<String>;
     /// Communication parameters for the ECU.
-    fn comparams(&self) -> ComplexComParamValue;
-    fn sdgs(&self, service: Option<&DiagComm>) -> Result<Vec<SdSdg>, DiagServiceError>;
+    /// # Errors
+    /// Will return `DiagServiceError` if the communication
+    /// parameters cannot be found in the database.
+    fn comparams(&self) -> Result<ComplexComParamValue, DiagServiceError>;
+    fn sdgs(
+        &self,
+        service: Option<&DiagComm>,
+    ) -> impl Future<Output = Result<Vec<SdSdg>, DiagServiceError>> + Send;
     /// Convert a UDS payload given as `u8` slice into a `DiagServiceResponse`.
     ///
     /// # Errors
@@ -112,7 +121,8 @@ pub trait EcuManager:
         diag_service: &DiagComm,
         payload: &ServicePayload,
         map_to_json: bool,
-    ) -> Result<Self::Response, DiagServiceError>;
+    ) -> impl Future<Output = Result<Self::Response, DiagServiceError>> + Send;
+
     /// Creates a `ServicePayload` and processes transitions based on raw UDS data,
     /// as received from a generic data endpoint.
     ///
@@ -136,7 +146,7 @@ pub trait EcuManager:
         diag_service: &DiagComm,
         security_plugin: &DynamicPlugin,
         data: Option<UdsPayloadData>,
-    ) -> Result<ServicePayload, DiagServiceError>;
+    ) -> impl Future<Output = Result<ServicePayload, DiagServiceError>> + Send;
     /// Looks up a single ECU job by name for the current ECU variant.
     /// # Errors
     /// Will return `Err` if the job cannot be found in the database
@@ -149,7 +159,7 @@ pub trait EcuManager:
     /// setting the session and security access back to the default value.
     /// To do this the defaults have to looked up which might fail.
     /// In that case the error is forwarded
-    fn set_session(&self, session: Id, expiration: Duration) -> Result<(), DiagServiceError>;
+    fn set_session(&self, session: &str, expiration: Duration) -> Result<(), DiagServiceError>;
     /// Update the internally tracked ecu security access.
     /// Has to be called after changing the session, to make sure the transition lookup keep working
     /// # Errors
@@ -159,14 +169,14 @@ pub trait EcuManager:
     /// In that case the error is forwarded
     fn set_security_access(
         &self,
-        security_access: Id,
+        security_access: &str,
         expiration: Duration,
     ) -> Result<(), DiagServiceError>;
     /// Lookup the transition between the active session and the requested one.
     /// # Errors
     /// * `DiagServiceError::AccessDenied` if no transition exists
     /// * `DiagServiceError::NotFound` on various lookup errors.
-    fn lookup_session_change(&self, session: &str) -> Result<(Id, DiagComm), DiagServiceError>;
+    fn lookup_session_change(&self, session: &str) -> Result<DiagComm, DiagServiceError>;
     /// Lookup the transition from the current security state to the given one.
     /// As switching to a new security state might need authentication.
     /// * `RequestSeed(DiagComm)`: A seeds needs to be requested via the provided diag comm.
@@ -183,13 +193,26 @@ pub trait EcuManager:
         seed_service: Option<&String>,
         has_key: bool,
     ) -> Result<SecurityAccess, DiagServiceError>;
+    /// Retrieves the name of the parameter used to send the key for security access.
+    /// # Errors
+    /// Will return `DiagServiceError` if the parameter cannot be found in the database
+    fn get_send_key_param_name(
+        &self,
+        diag_service: &DiagComm,
+    ) -> impl Future<Output = Result<String, DiagServiceError>> + Send;
     /// Retrieves the name of the current ecu session, i.e. 'extended', 'programming' or 'default'.
     /// The examples above differ depending on the parameterization of the ECU.
-    fn session(&self) -> String;
+    /// # Errors
+    /// Will return `DiagServiceError` if the session cannot be found in the database
+    /// or no session is currently set or no variant is loaded.
+    fn session(&self) -> Result<String, DiagServiceError>;
     /// Retrieves the name of the current ecu security level,
-    /// i.e. 'level_42'
+    /// i.e. `level_42`
     /// The exact values depends on the ECU parameterization.
-    fn security_access(&self) -> String;
+    /// # Errors
+    /// Will return `DiagServiceError` if the security access cannot be found in the database
+    /// or no security access is currently set or no variant is loaded.
+    fn security_access(&self) -> Result<String, DiagServiceError>;
     /// Lookup a service by a given function class name and service id.
     /// # Errors
     /// Will return `Err` if the lookup failed
@@ -206,12 +229,16 @@ pub trait EcuManager:
     /// Retrieve all `read` services for the current ECU variant.
     fn get_components_data_info(&self) -> Vec<ComponentDataInfo>;
     /// Retrieve all configuration type services for the current ECU variant.
+    /// # Errors
+    /// Returns `DiagServiceError` if the lookup failed.
     fn get_components_configurations_info(
         &self,
     ) -> Result<Vec<ComponentConfigurationsInfo>, DiagServiceError>;
     /// Retrieve all 'single ecu' jobs for the current ECU variant.
     fn get_components_single_ecu_jobs_info(&self) -> Vec<ComponentDataInfo>;
     /// Lookup DTC services for the given service types in the current ECU variant.
+    /// # Errors
+    /// Returns `DiagServiceError` if the lookup failed.
     fn lookup_dtc_services(
         &self,
         service_types: Vec<DtcReadInformationFunction>,
@@ -220,7 +247,7 @@ pub trait EcuManager:
         &self,
         service: &DiagComm,
         security_plugin: &DynamicPlugin,
-    ) -> Result<(), DiagServiceError>;
+    ) -> impl Future<Output = Result<(), DiagServiceError>> + Send;
 }
 
 impl Protocol {

@@ -62,7 +62,7 @@ pub(crate) async fn get<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManage
         Ok(v) => HashMap::from([("name".to_owned(), v)]),
         Err(e) => {
             return ErrorWrapper {
-                error: ApiError::BadRequest(e),
+                error: e.into(),
                 include_schema,
             }
             .into_response();
@@ -70,15 +70,15 @@ pub(crate) async fn get<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManage
     };
 
     let sdgs = if query.include_sdgs {
-        match uds
-            .get_sdgs(&ecu_name, None)
-            .await
-            .map_err(ApiError::BadRequest)
-        {
-            Ok(v) => Some(v.into_iter().map(|sdg| sdg.into_sovd()).collect()),
+        match uds.get_sdgs(&ecu_name, None).await {
+            Ok(v) => Some(
+                v.into_iter()
+                    .map(super::super::IntoSovd::into_sovd)
+                    .collect(),
+            ),
             Err(e) => {
                 return ErrorWrapper {
-                    error: e,
+                    error: e.into(),
                     include_schema,
                 }
                 .into_response();
@@ -161,7 +161,7 @@ async fn update<T: UdsEcu + Clone>(ecu_name: &str, uds: T) -> Response {
     match uds.detect_variant(ecu_name).await {
         Ok(()) => (StatusCode::CREATED, ()).into_response(),
         Err(e) => ErrorWrapper {
-            error: ApiError::BadRequest(e),
+            error: e.into(),
             include_schema: false,
         }
         .into_response(),
@@ -206,7 +206,7 @@ impl IntoSovd for cda_interfaces::datatypes::ComParamSimpleValue {
 }
 
 openapi::aide_helper::gen_path_param!(DiagServicePathParam diag_service String);
-
+#[allow(clippy::too_many_lines)] // splitting is not worth it here
 async fn data_request<T: UdsEcu + SchemaProvider + Clone>(
     service: DiagComm,
     ecu_name: &str,
@@ -272,7 +272,7 @@ async fn data_request<T: UdsEcu + SchemaProvider + Clone>(
         match gateway
             .schema_for_responses(ecu_name, &service)
             .await
-            .map(|desc| desc.into_schema())
+            .map(cda_interfaces::SchemaDescription::into_schema)
         {
             Ok(data_schema) => Some(create_response_schema!(
                 sovd_interfaces::ObjectDataItem<VendorErrorCode>,
@@ -300,7 +300,7 @@ async fn data_request<T: UdsEcu + SchemaProvider + Clone>(
             map_to_json,
         )
         .await
-        .map_err(std::convert::Into::into)
+        .map_err(Into::into)
     {
         Err(e) => {
             return ErrorWrapper {
@@ -313,7 +313,7 @@ async fn data_request<T: UdsEcu + SchemaProvider + Clone>(
     };
 
     if let DiagServiceResponseType::Negative = response.response_type() {
-        return api_error_from_diag_response(response, include_schema).into_response();
+        return api_error_from_diag_response(&response, include_schema).into_response();
     }
 
     if response.is_empty() {

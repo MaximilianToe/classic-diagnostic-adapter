@@ -16,6 +16,9 @@ use std::{
     time::Duration,
 };
 
+use cda_tracing::TracingSetupError;
+use thiserror::Error;
+
 mod com_param_handling;
 pub use com_param_handling::*;
 pub mod datatypes;
@@ -42,8 +45,6 @@ pub(crate) mod strings;
 pub use strings::*;
 pub mod util;
 
-pub type Id = u32;
-
 pub type DynamicPlugin = Box<dyn std::any::Any + Send + Sync>;
 
 #[derive(Debug, Clone)]
@@ -58,16 +59,35 @@ pub enum DiagCommAction {
 #[cfg_attr(feature = "deepsize", derive(DeepSizeOf))]
 pub struct DiagComm {
     pub name: String,
-    pub action: DiagCommAction,
     pub type_: DiagCommType,
     pub lookup_name: Option<String>,
+}
+
+impl DiagComm {
+    #[must_use]
+    pub fn action(&self) -> DiagCommAction {
+        self.type_.clone().into()
+    }
+}
+
+impl From<DiagCommType> for DiagCommAction {
+    fn from(value: DiagCommType) -> Self {
+        match value {
+            DiagCommType::Configurations => DiagCommAction::Write,
+            DiagCommType::Data => DiagCommAction::Read,
+            // Faults is actually Clear or Read, but doesn't matter here
+            DiagCommType::Faults | DiagCommType::Modes | DiagCommType::Operations => {
+                DiagCommAction::Start
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "deepsize", derive(DeepSizeOf))]
 /// Enum representing diagnostic communication types according to ASAM SOVD.
 ///
-/// Can be mapped to UDS service prefixes with [`DiagCommType::service_prefix`]
+/// Can be mapped to UDS service prefixes with [`DiagCommType::service_prefixes`]
 pub enum DiagCommType {
     /// Service Prefix `0x2E`
     Configurations,
@@ -81,10 +101,38 @@ pub enum DiagCommType {
     Operations,
 }
 
+impl TryFrom<u8> for DiagCommType {
+    type Error = DiagServiceError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            service_ids::WRITE_DATA_BY_IDENTIFIER => Ok(DiagCommType::Configurations),
+            service_ids::READ_DATA_BY_IDENTIFIER => Ok(DiagCommType::Data),
+            service_ids::CLEAR_DIAGNOSTIC_INFORMATION | service_ids::READ_DTC_INFORMATION => {
+                Ok(DiagCommType::Faults)
+            }
+            service_ids::SESSION_CONTROL
+            | service_ids::ECU_RESET
+            | service_ids::SECURITY_ACCESS
+            | service_ids::COMMUNICATION_CONTROL
+            | service_ids::AUTHENTICATION
+            | service_ids::CONTROL_DTC_SETTING => Ok(DiagCommType::Modes),
+            service_ids::INPUT_OUTPUT_CONTROL_BY_IDENTIFIER
+            | service_ids::ROUTINE_CONTROL
+            | service_ids::REQUEST_DOWNLOAD
+            | service_ids::TRANSFER_DATA
+            | service_ids::REQUEST_TRANSFER_EXIT => Ok(DiagCommType::Operations),
+            _ => Err(DiagServiceError::InvalidRequest(format!(
+                "Invalid DiagCommType value: {value}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum SecurityAccess {
     RequestSeed(DiagComm),
-    SendKey((Id, DiagComm)),
+    SendKey(DiagComm),
 }
 
 #[derive(Clone, Debug)]
@@ -95,8 +143,8 @@ pub enum TesterPresentMode {
 
 #[derive(Clone, Debug)]
 pub enum TesterPresentType {
-    Functional,
-    // Ecu, // todo support tester present for single ecus
+    Functional(String),
+    Ecu(String),
 }
 
 #[derive(Clone, Debug)]
@@ -125,12 +173,46 @@ pub mod service_ids {
     pub const REQUEST_TRANSFER_EXIT: u8 = 0x37;
     pub const TESTER_PRESENT: u8 = 0x3E;
     pub const CONTROL_DTC_SETTING: u8 = 0x85;
+    pub const NEGATIVE_RESPONSE: u8 = 0x7F;
+}
+
+const CONFIGURATIONS_PREFIXES: [u8; 1] = [service_ids::WRITE_DATA_BY_IDENTIFIER];
+
+const DATA_PREFIXES: [u8; 1] = [service_ids::READ_DATA_BY_IDENTIFIER];
+
+const FAULTS_PREFIXES: [u8; 2] = [
+    service_ids::CLEAR_DIAGNOSTIC_INFORMATION,
+    service_ids::READ_DTC_INFORMATION,
+];
+
+const MODES_PREFIXES: [u8; 6] = [
+    service_ids::SESSION_CONTROL,
+    service_ids::ECU_RESET,
+    service_ids::SECURITY_ACCESS,
+    service_ids::COMMUNICATION_CONTROL,
+    service_ids::AUTHENTICATION,
+    service_ids::CONTROL_DTC_SETTING,
+];
+
+const OPERATIONS_PREFIXES: [u8; 5] = [
+    service_ids::INPUT_OUTPUT_CONTROL_BY_IDENTIFIER,
+    service_ids::ROUTINE_CONTROL,
+    service_ids::REQUEST_DOWNLOAD,
+    service_ids::TRANSFER_DATA,
+    service_ids::REQUEST_TRANSFER_EXIT,
+];
+
+impl TesterPresentType {
+    #[must_use]
+    pub fn is_functional(&self) -> bool {
+        matches!(self, TesterPresentType::Functional(_))
+    }
 }
 
 impl DiagCommType {
     #[must_use]
     /// This function returns the service prefix for the given `DiagCommType`
-    /// acccording to ASAM_SOVD_BS_V1-0-0
+    /// according to ASAM_SOVD_BS_V1-0-0
     /// # Service Prefixes Mapping
     ///  - `0x2E` -> `<entity>/configurations`
     ///  - `0x22` -> `<entity>/data`
@@ -141,29 +223,13 @@ impl DiagCommType {
     ///  - `0x27 | 0x29` -> `<entity>/modes/security`
     ///  - `0x14 | 0x19` -> `<entity>/faults`
     ///  - `0x2F | 0x31` -> `<entity>/operations`
-    pub fn service_prefix(&self) -> Vec<u8> {
+    pub fn service_prefixes(&self) -> &'static [u8] {
         match self {
-            DiagCommType::Configurations => vec![service_ids::WRITE_DATA_BY_IDENTIFIER],
-            DiagCommType::Data => vec![service_ids::READ_DATA_BY_IDENTIFIER],
-            DiagCommType::Faults => vec![
-                service_ids::CLEAR_DIAGNOSTIC_INFORMATION,
-                service_ids::READ_DTC_INFORMATION,
-            ],
-            DiagCommType::Modes => vec![
-                service_ids::SESSION_CONTROL,
-                service_ids::ECU_RESET,
-                service_ids::SECURITY_ACCESS,
-                service_ids::COMMUNICATION_CONTROL,
-                service_ids::AUTHENTICATION,
-                service_ids::CONTROL_DTC_SETTING,
-            ],
-            DiagCommType::Operations => vec![
-                service_ids::INPUT_OUTPUT_CONTROL_BY_IDENTIFIER,
-                service_ids::ROUTINE_CONTROL,
-                service_ids::REQUEST_DOWNLOAD,
-                service_ids::TRANSFER_DATA,
-                service_ids::REQUEST_TRANSFER_EXIT,
-            ],
+            DiagCommType::Configurations => &CONFIGURATIONS_PREFIXES,
+            DiagCommType::Data => &DATA_PREFIXES,
+            DiagCommType::Faults => &FAULTS_PREFIXES,
+            DiagCommType::Modes => &MODES_PREFIXES,
+            DiagCommType::Operations => &OPERATIONS_PREFIXES,
         }
     }
 }
@@ -171,7 +237,8 @@ impl DiagCommType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "deepsize", derive(DeepSizeOf))]
 pub enum DiagServiceError {
-    NotFound,
+    /// Returned in case a resource can not be found
+    NotFound(Option<String>),
     RequestNotSupported(String),
     InvalidDatabase(String),
     DatabaseEntryNotFound(String),
@@ -189,17 +256,71 @@ pub enum DiagServiceError {
     },
     VariantDetectionError(String),
     InvalidSession(String),
+    InvalidAddress(String),
     SendFailed(String),
     Nack(u8),
-    UnexpectedResponse,
+    UnexpectedResponse(Option<String>),
     NoResponse(String),
     ConnectionClosed,
     EcuOffline(String),
     Timeout,
     AccessDenied(String),
+    ConfigurationError(String),
+    /// Returned in case a resource can be found but returns an error
+    ResourceError(String),
     DataError(DataParseError),
-    /// Returned in case the provided value for security plugin cannot be used as SecurityApi
+    SetupError(String),
+    /// Returned in case the provided value for security plugin cannot be used as `SecurityApi`
     InvalidSecurityPlugin,
+}
+
+impl From<TracingSetupError> for DiagServiceError {
+    fn from(value: TracingSetupError) -> Self {
+        match &value {
+            TracingSetupError::ResourceCreationFailed(_) => {
+                DiagServiceError::ResourceError(value.to_string())
+            }
+            TracingSetupError::SubscriberInitializationFailed(_) => {
+                DiagServiceError::SetupError(value.to_string())
+            }
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum DoipGatewaySetupError {
+    #[error("Invalid address: `{0}`")]
+    InvalidAddress(String),
+    #[error("Socket error: `{0}`")]
+    SocketCreationFailed(String),
+    #[error("Port error: `{0}`")]
+    PortBindFailed(String),
+    #[error("Configuration error: `{0}`")]
+    InvalidConfiguration(String),
+    #[error("Resource error: `{0}`")]
+    ResourceError(String),
+    #[error("Server error: `{0}`")]
+    ServerError(String),
+}
+
+impl From<DoipGatewaySetupError> for DiagServiceError {
+    fn from(value: DoipGatewaySetupError) -> Self {
+        match value {
+            DoipGatewaySetupError::InvalidAddress(_) => {
+                DiagServiceError::InvalidAddress(value.to_string())
+            }
+            DoipGatewaySetupError::SocketCreationFailed(_)
+            | DoipGatewaySetupError::PortBindFailed(_) => {
+                DiagServiceError::SetupError(value.to_string())
+            }
+            DoipGatewaySetupError::InvalidConfiguration(_) => {
+                DiagServiceError::ConfigurationError(value.to_string())
+            }
+            DoipGatewaySetupError::ResourceError(_) | DoipGatewaySetupError::ServerError(_) => {
+                DiagServiceError::ResourceError(value.to_string())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +333,8 @@ pub struct DataParseError {
 impl Display for DiagServiceError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            DiagServiceError::NotFound => write!(f, "Not found"),
+            DiagServiceError::NotFound(Some(msg)) => write!(f, "Not found: {msg}"),
+            DiagServiceError::NotFound(None) => write!(f, "Not found"),
             DiagServiceError::RequestNotSupported(msg) => write!(f, "Request not supported: {msg}"),
             DiagServiceError::InvalidDatabase(msg) => write!(f, "Invalid database: {msg}"),
             DiagServiceError::DatabaseEntryNotFound(msg) => {
@@ -232,19 +354,25 @@ impl Display for DiagServiceError {
             DiagServiceError::VariantDetectionError(msg) => {
                 write!(f, "Variant detection error: {msg}")
             }
-            DiagServiceError::InvalidSession(msg) => {
+            DiagServiceError::InvalidSession(msg) | DiagServiceError::InvalidAddress(msg) => {
                 write!(f, "{msg}")
             }
             DiagServiceError::SendFailed(msg) => {
                 write!(f, "Sending message failed {msg}")
             }
             DiagServiceError::Nack(code) => write!(f, "Received Nack, code={code:?}"),
-            DiagServiceError::UnexpectedResponse => write!(f, "Unexpected response"),
+            DiagServiceError::UnexpectedResponse(Some(msg)) => {
+                write!(f, "Unexpected response. {msg}")
+            }
+            DiagServiceError::UnexpectedResponse(None) => write!(f, "Unexpected response."),
             DiagServiceError::NoResponse(msg) => write!(f, "No response {msg}"),
             DiagServiceError::ConnectionClosed => write!(f, "Connection closed"),
             DiagServiceError::EcuOffline(ecu) => write!(f, "Ecu {ecu} offline"),
             DiagServiceError::Timeout => write!(f, "Timeout"),
             DiagServiceError::AccessDenied(msg) => write!(f, "Access denied: {msg}"),
+            DiagServiceError::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
+            DiagServiceError::ResourceError(msg) => write!(f, "Resource error: {msg}"),
+            DiagServiceError::SetupError(msg) => write!(f, "Setup error: {msg}"),
             DiagServiceError::DataError(DataParseError { value, details }) => {
                 write!(f, "Data parse error: value='{value}', details='{details}'")
             }
@@ -260,7 +388,8 @@ impl std::fmt::Display for DiagComm {
         write!(
             f,
             "DiagService ( name: {}, operation: {:?} )",
-            self.name, self.action
+            self.name,
+            self.action()
         )
     }
 }

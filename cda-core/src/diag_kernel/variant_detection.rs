@@ -12,128 +12,107 @@
  */
 
 use cda_database::datatypes;
-use cda_interfaces::{DiagServiceError, STRINGS, diagservices::DiagServiceResponse};
+use cda_interfaces::{DiagServiceError, diagservices::DiagServiceResponse};
 use hashbrown::{HashMap, HashSet};
 
-#[derive(Debug)]
-pub(super) struct ExpectedParamValue {
-    pub expected_value: String,
-    pub parameter: String,
-}
 pub(super) type DiagServiceId = String;
-
-pub(super) type ExpectedParamMap = HashMap<DiagServiceId, Vec<ExpectedParamValue>>;
-pub(super) type VariantPatterns = Vec<ExpectedParamMap>;
 
 pub(super) struct VariantDetection {
     pub(crate) diag_service_requests: HashSet<DiagServiceId>,
-    pub(crate) variant_param_map: HashMap<u32, VariantPatterns>,
 }
 
-#[tracing::instrument(
-    skip(diagnostic_database),
-    fields(variants_count = diagnostic_database.variants.len())
-)]
 pub(super) fn prepare_variant_detection(
     diagnostic_database: &datatypes::DiagnosticDatabase,
 ) -> Result<VariantDetection, DiagServiceError> {
-    let mut diag_service_requests = HashSet::new();
-    let mut variant_param_map: HashMap<u32, VariantPatterns> = HashMap::new();
-    for (id, v) in &diagnostic_database.variants {
-        if v.is_base {
-            continue;
-        }
-
-        let mut patterns = Vec::new();
-        for p in &v.pattern {
-            let mut expected_param_map: ExpectedParamMap = HashMap::new();
-            for mp in &p.matching_parameters {
-                let diag_service_id = diagnostic_database
-                    .services
-                    .get(&mp.service_id)
-                    .and_then(|s| STRINGS.get(s.short_name))
-                    .ok_or_else(|| {
-                        DiagServiceError::InvalidDatabase("DiagService not found".to_owned())
-                    })?;
-                let expected_value = STRINGS.get(mp.expected_value).ok_or_else(|| {
-                    DiagServiceError::InvalidDatabase("Expected value not found".to_owned())
-                })?;
-                let parameter = diagnostic_database
-                    .params
-                    .get(&mp.param_id)
-                    .and_then(|p| STRINGS.get(p.short_name))
-                    .ok_or_else(|| {
-                        DiagServiceError::InvalidDatabase("Parameter not found".to_owned())
-                    })?;
-
-                let expected_param_value = ExpectedParamValue {
-                    expected_value,
-                    parameter,
-                };
-                diag_service_requests.insert(diag_service_id.clone());
-                expected_param_map
-                    .entry(diag_service_id)
-                    .or_insert(Vec::new())
-                    .push(expected_param_value);
-            }
-            patterns.push(expected_param_map);
-        }
-        variant_param_map.insert(*id, patterns);
-    }
+    let diag_service_requests: HashSet<_> = diagnostic_database
+        .ecu_data()?
+        .variants()
+        .map(|variants| {
+            variants
+                .iter()
+                .filter(|v| !v.is_base_variant())
+                .flat_map(|v| {
+                    v.variant_pattern().into_iter().flat_map(|patterns| {
+                        patterns.iter().flat_map(|pattern| {
+                            pattern.matching_parameter().into_iter().flat_map(|params| {
+                                params.iter().filter_map(|mp| {
+                                    mp.diag_service()
+                                        .and_then(|ds| ds.diag_comm())
+                                        .and_then(|dc| dc.short_name())
+                                        .map(ToOwned::to_owned)
+                                })
+                            })
+                        })
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     Ok(VariantDetection {
         diag_service_requests,
-        variant_param_map,
     })
 }
 
-impl VariantDetection {
-    #[tracing::instrument(
-        skip(self, service_responses),
-        fields(response_count = service_responses.len())
-    )]
-    pub(super) fn evaluate_variant<T: DiagServiceResponse + Sized>(
-        &self,
-        service_responses: HashMap<String, T>,
-    ) -> Result<u32, DiagServiceError> {
-        let service_responses = service_responses
-            .into_iter()
-            .map(|(service, res)| {
-                let json = res.into_json()?;
-                let params = json
-                    .data
-                    .as_object()
-                    .ok_or_else(|| {
-                        DiagServiceError::ParameterConversionError(
-                            "Expected JSON object".to_owned(),
-                        )
-                    })?
-                    .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value.to_string().replace('"', ""), // remove quotes
-                        )
-                    })
-                    .collect::<HashMap<String, String>>();
-                Ok((service, params))
-            })
-            .collect::<Result<HashMap<String, HashMap<String, String>>, DiagServiceError>>()?;
+#[tracing::instrument(
+    skip(service_responses, diagnostic_database),
+    fields(response_count = service_responses.len())
+)]
+pub(super) fn evaluate_variant<T: DiagServiceResponse + Sized>(
+    service_responses: HashMap<String, T>,
+    diagnostic_database: &datatypes::DiagnosticDatabase,
+) -> Result<datatypes::Variant<'_>, DiagServiceError> {
+    let service_responses = service_responses
+        .into_iter()
+        .map(|(service, res)| {
+            let json = res.into_json()?;
+            let params = json
+                .data
+                .as_object()
+                .ok_or_else(|| {
+                    DiagServiceError::ParameterConversionError("Expected JSON object".to_owned())
+                })?
+                .into_iter()
+                .map(|(name, value)| (name.clone(), value.to_string().replace('"', "")))
+                .collect::<HashMap<String, String>>();
+            Ok((service, params))
+        })
+        .collect::<Result<HashMap<String, HashMap<String, String>>, DiagServiceError>>()?;
 
-        self.variant_param_map
-            .iter()
-            .find(|(_, patterns)| {
-                patterns.iter().any(|expected_services| {
-                    expected_services.iter().all(|(service, expected_params)| {
-                        expected_params.iter().all(|expected_param| {
+    let variants = diagnostic_database.ecu_data()?.variants().ok_or_else(|| {
+        DiagServiceError::InvalidDatabase(format!(
+            "ECU {:?} has no variants!",
+            diagnostic_database.ecu_name()
+        ))
+    })?;
+
+    variants
+        .iter()
+        .find(|variant| {
+            variant.variant_pattern().is_some_and(|patterns| {
+                patterns.iter().any(|pattern| {
+                    pattern.matching_parameter().is_some_and(|params| {
+                        params.iter().all(|matching_param| {
+                            let expected_value =
+                                matching_param.expected_value().unwrap_or_default();
+                            let expected_param = matching_param
+                                .out_param()
+                                .and_then(|out_param| out_param.short_name())
+                                .unwrap_or_default();
+                            let service = matching_param
+                                .diag_service()
+                                .and_then(|ds| ds.diag_comm())
+                                .and_then(|dc| dc.short_name())
+                                .unwrap_or_default();
+
                             service_responses
                                 .get(service)
                                 .and_then(|params| {
                                     params
                                         .iter()
-                                        .find(|(name, _)| **name == expected_param.parameter)
+                                        .find(|(name, _)| **name == expected_param)
                                         .map(|(_name, value)| {
-                                            value.replace('"', "") == expected_param.expected_value
+                                            value.replace('"', "") == expected_value
                                         })
                                 })
                                 .unwrap_or(false)
@@ -141,14 +120,19 @@ impl VariantDetection {
                     })
                 })
             })
-            .map(|(id, _)| *id)
-            .ok_or_else(|| {
-                tracing::debug!(
-                    expected_services = ?self.variant_param_map,
-                    received_responses = ?service_responses,
-                    "No variant found for expected services"
-                );
-                DiagServiceError::VariantDetectionError("No variant found".to_owned())
-            })
-    }
+        })
+        .or(variants.iter().find(|variant| {
+            // Closure is not redundant, as we cannot access the inner type
+            // of variant directly.
+            #[allow(clippy::redundant_closure)]
+            variant.is_base_variant()
+        }))
+        .map(datatypes::Variant)
+        .ok_or_else(move || {
+            tracing::debug!(
+                received_responses = ?service_responses,
+                "No variant found for expected services"
+            );
+            DiagServiceError::VariantDetectionError("No variant found".to_owned())
+        })
 }

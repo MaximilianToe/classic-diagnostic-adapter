@@ -18,10 +18,10 @@ use std::{
 };
 
 use cda_interfaces::{
-    DiagComm, DiagCommAction, DiagCommType, DiagServiceError, DynamicPlugin, EcuGateway,
-    EcuManager, FlashTransferStartParams, SchemaDescription, SchemaProvider, SecurityAccess,
-    ServicePayload, TesterPresentControlMessage, TesterPresentMode, TesterPresentType,
-    TransmissionParameters, UdsEcu, UdsResponse, datatypes,
+    DiagComm, DiagCommType, DiagServiceError, DynamicPlugin, EcuGateway, EcuManager,
+    FlashTransferStartParams, SchemaDescription, SchemaProvider, SecurityAccess, ServicePayload,
+    TesterPresentControlMessage, TesterPresentMode, TesterPresentType, TransmissionParameters,
+    UdsEcu, UdsResponse, datatypes,
     datatypes::{
         ComponentConfigurationsInfo, DTC_CODE_BIT_LEN, DataTransferError, DataTransferMetaData,
         DataTransferStatus, DtcCode, DtcExtendedInfo, DtcMask, DtcReadInformationFunction,
@@ -75,18 +75,17 @@ pub struct UdsManager<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Respo
 }
 
 impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsManager<S, R, T> {
-    pub async fn new(
+    pub fn new(
         gateway: S,
         ecus: Arc<HashMap<String, RwLock<T>>>,
         mut variant_detection_receiver: mpsc::Receiver<Vec<String>>,
-        mut tester_present_receiver: mpsc::Receiver<TesterPresentControlMessage>,
-    ) -> Result<Self, String> {
+    ) -> Self {
         let manager = Self {
             ecus,
             gateway,
             data_transfers: Arc::new(Mutex::new(HashMap::new())),
             tester_present_tasks: Arc::new(RwLock::new(HashMap::new())),
-            _phantom: Default::default(),
+            _phantom: std::marker::PhantomData,
         };
 
         let vd_uds_clone = manager.clone();
@@ -96,19 +95,15 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
             }
         });
 
-        let mut tp_uds_clone = manager.clone();
-        cda_interfaces::spawn_named!("tester-present-receiver", async move {
-            while let Some(tp_cm) = tester_present_receiver.recv().await {
-                if let Err(e) = tp_uds_clone.control_tester_present(tp_cm).await {
-                    tracing::error!(
-                        error = ?e,
-                        "control_tester_present returned error, message discarded"
-                    );
-                }
-            }
-        });
+        manager
+    }
 
-        Ok(manager)
+    fn ecu_diag_service(&self, ecu_name: &str) -> Result<&RwLock<T>, DiagServiceError> {
+        self.ecus
+            .get(ecu_name)
+            .ok_or(DiagServiceError::NotFound(Some(format!(
+                "ECU {ecu_name} not found"
+            ))))
     }
 
     #[tracing::instrument(
@@ -126,10 +121,11 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
     ) -> Result<R, DiagServiceError> {
         let start = Instant::now();
         tracing::debug!(service = ?service, payload = ?payload, "Sending UDS request");
-        let ecu = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu = self.ecu_diag_service(ecu_name)?;
         let payload = {
             let ecu = ecu.read().await;
-            ecu.create_uds_payload(&service, security_plugin, payload)?
+            ecu.create_uds_payload(&service, security_plugin, payload)
+                .await?
         };
 
         let payload_build_after = start.elapsed();
@@ -137,20 +133,24 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         let response = self
             .send_with_raw_payload(ecu_name, payload, timeout, true)
             .await;
-        let response_after = start.elapsed() - payload_build_after;
+        let response_after = start.elapsed().saturating_sub(payload_build_after);
 
         let response = match response {
-            Ok(msg) => self
-                .ecus
-                .get(ecu_name)
-                .expect("ECU name has been already checked")
-                .read()
-                .await
-                .convert_from_uds(&service, &msg.expect("response expected"), map_to_json),
+            Ok(msg) => {
+                self.ecu_diag_service(ecu_name)
+                    .expect("ECU name has been already checked")
+                    .read()
+                    .await
+                    .convert_from_uds(&service, &msg.expect("response expected"), map_to_json)
+                    .await
+            }
             Err(e) => Err(e),
         };
 
-        let response_mapped = start.elapsed() - payload_build_after - response_after;
+        let response_mapped = start
+            .elapsed()
+            .saturating_sub(payload_build_after)
+            .saturating_sub(response_after);
         tracing::debug!(
             total_duration = ?start.elapsed(),
             payload_build_duration = ?payload_build_after,
@@ -162,6 +162,8 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         response
     }
 
+    // allowed for clarity, to make it clearer which of the loops is being continued
+    #[allow(clippy::needless_continue)]
     #[tracing::instrument(
         skip(self, payload),
         fields(ecu_name, expect_response, payload_size = payload.data.len())
@@ -175,30 +177,8 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
     ) -> Result<Option<ServicePayload>, DiagServiceError> {
         let start = std::time::Instant::now();
 
-        let ecu = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
-        let (uds_params, transmission_params) = {
-            let ecu = ecu.read().await;
-            (
-                UdsParameters {
-                    timeout_default: ecu.timeout_default(),
-                    rc_21_retry_policy: ecu.rc_21_retry_policy(),
-                    rc_21_completion_timeout: ecu.rc_21_completion_timeout(),
-                    rc_21_repeat_request_time: ecu.rc_21_repeat_request_time(),
-                    rc_78_retry_policy: ecu.rc_78_retry_policy(),
-                    rc_78_completion_timeout: ecu.rc_78_completion_timeout(),
-                    rc_78_timeout: ecu.rc_78_timeout(),
-                    rc_94_retry_policy: ecu.rc_94_retry_policy(),
-                    rc_94_completion_timeout: ecu.rc_94_completion_timeout(),
-                    rc_94_repeat_request_time: ecu.rc_94_repeat_request_time(),
-                },
-                TransmissionParameters {
-                    gateway_address: ecu.logical_gateway_address(),
-                    timeout_ack: ecu.diagnostic_ack_timeout(),
-                    ecu_name: ecu.ecu_name(),
-                    repeat_request_count_transmission: ecu.repeat_request_count_transmission(),
-                },
-            )
-        };
+        let ecu = self.ecu_diag_service(ecu_name)?;
+        let (uds_params, transmission_params) = Self::ecu_send_params(ecu).await;
 
         let rx_timeout = timeout.unwrap_or(uds_params.timeout_default);
         let mut rx_timeout_next = None;
@@ -289,7 +269,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                                 continue 'read_uds_messages; // continue reading UDS frames
                             }
                             Ok(_) => {
-                                break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse);
+                                break 'read_uds_messages Err(
+                                    DiagServiceError::UnexpectedResponse(None),
+                                );
                             }
                             Err(e) => {
                                 // i.e. happens when the response is a NACK
@@ -304,7 +286,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                     }
                     Ok(None) => {
                         tracing::warn!("None response received");
-                        break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse);
+                        break 'read_uds_messages Err(DiagServiceError::UnexpectedResponse(None));
                     }
                     Err(_) => {
                         // error means the tokio::time::timeout
@@ -316,7 +298,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
             break 'send (uds_result, sent_after);
         };
 
-        let finish = start.elapsed() - sent_after;
+        let finish = start.elapsed().saturating_sub(sent_after);
         tracing::debug!(
             total_duration = ?start.elapsed(),
             send_duration = ?sent_after,
@@ -325,6 +307,33 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         );
 
         response.map(Option::from)
+    }
+
+    async fn ecu_send_params(ecu: &RwLock<T>) -> (UdsParameters, TransmissionParameters) {
+        let (uds_params, transmission_params) = {
+            let ecu = ecu.read().await;
+            (
+                UdsParameters {
+                    timeout_default: ecu.timeout_default(),
+                    rc_21_retry_policy: ecu.rc_21_retry_policy(),
+                    rc_21_completion_timeout: ecu.rc_21_completion_timeout(),
+                    rc_21_repeat_request_time: ecu.rc_21_repeat_request_time(),
+                    rc_78_retry_policy: ecu.rc_78_retry_policy(),
+                    rc_78_completion_timeout: ecu.rc_78_completion_timeout(),
+                    rc_78_timeout: ecu.rc_78_timeout(),
+                    rc_94_retry_policy: ecu.rc_94_retry_policy(),
+                    rc_94_completion_timeout: ecu.rc_94_completion_timeout(),
+                    rc_94_repeat_request_time: ecu.rc_94_repeat_request_time(),
+                },
+                TransmissionParameters {
+                    gateway_address: ecu.logical_gateway_address(),
+                    timeout_ack: ecu.diagnostic_ack_timeout(),
+                    ecu_name: ecu.ecu_name(),
+                    repeat_request_count_transmission: ecu.repeat_request_count_transmission(),
+                },
+            )
+        };
+        (uds_params, transmission_params)
     }
 
     #[tracing::instrument(
@@ -347,7 +356,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         ) {
             if let Some(dt) = transfers.lock().await.get_mut(ecu_name) {
                 dt.meta_data.status = DataTransferStatus::Aborted;
-                dt.meta_data.error = Some(vec![DataTransferError { text: reason }])
+                dt.meta_data.error = Some(vec![DataTransferError { text: reason }]);
             }
             if let Err(e) = sender.send(true) {
                 tracing::error!(error = ?e, "Failed to send data transfer aborted signal");
@@ -356,12 +365,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
 
         let (mut buffer, mut remaining_bytes, block_size, mut next_block_sequence_counter) = {
             let mut lock = self.data_transfers.lock().await;
-            let transfer = match lock.get_mut(ecu_name) {
-                Some(transfer) => transfer,
-                None => {
-                    tracing::error!("No transfer found, cannot start data transfer");
-                    return;
-                }
+            let Some(transfer) = lock.get_mut(ecu_name) else {
+                tracing::error!("No transfer found, cannot start data transfer");
+                return;
             };
             transfer.meta_data.status = DataTransferStatus::Running;
             (
@@ -427,12 +433,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
 
             {
                 let mut lock = self.data_transfers.lock().await;
-                let transfer = match lock.get_mut(ecu_name) {
-                    Some(transfer) => transfer,
-                    None => {
-                        tracing::error!("No transfer found, cannot update data transfer");
-                        return;
-                    }
+                let Some(transfer) = lock.get_mut(ecu_name) else {
+                    tracing::error!("No transfer found, cannot update data transfer");
+                    return;
                 };
 
                 next_block_sequence_counter = next_block_sequence_counter.wrapping_add(1);
@@ -470,17 +473,17 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
     }
 
     async fn control_tester_present(
-        &mut self,
+        &self,
         control_msg: TesterPresentControlMessage,
-    ) -> Result<(), String> {
+    ) -> Result<(), DiagServiceError> {
         match control_msg.mode {
             TesterPresentMode::Start => {
                 let mut tester_presents = self.tester_present_tasks.write().await;
                 if tester_presents.get(&control_msg.ecu).is_some() {
-                    return Err(format!(
+                    return Err(DiagServiceError::InvalidRequest(format!(
                         "A tester present for {} is already running",
                         control_msg.ecu
-                    ));
+                    )));
                 }
 
                 let interval = if let Some(i) = control_msg.interval {
@@ -489,18 +492,26 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                     let ecu = self
                         .ecus
                         .get(&control_msg.ecu)
-                        .expect("ecu checked before and must exist");
+                        .ok_or(DiagServiceError::NotFound(None))?;
                     ecu.read().await.tester_present_time()
                 };
 
                 let mut uds = self.clone();
                 let msg_clone = control_msg.clone();
                 let task = cda_interfaces::spawn_named!(
-                    &format!("tester-present-{}", control_msg.ecu),
+                    &format!(
+                        "tester-present-{}{}",
+                        control_msg.ecu,
+                        if control_msg.type_.is_functional() {
+                            "-functional"
+                        } else {
+                            ""
+                        }
+                    ),
                     async move {
                         loop {
                             if let Err(e) = uds.send_tester_present(&control_msg).await {
-                                tracing::error!(error = %e, "Failed to send tester present")
+                                tracing::error!(error = %e, "Failed to send tester present");
                             }
                             tokio::time::sleep(interval).await;
                         }
@@ -523,10 +534,12 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                     .write()
                     .await
                     .remove(&control_msg.ecu)
-                    .ok_or(format!(
-                        "ECU {} has no active tester present task",
-                        control_msg.ecu
-                    ))?;
+                    .ok_or_else(|| {
+                        DiagServiceError::InvalidRequest(format!(
+                            "ECU {} has no active tester present task",
+                            control_msg.ecu
+                        ))
+                    })?;
                 tester_present.task.abort();
                 Ok(())
             }
@@ -537,19 +550,21 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         &mut self,
         control_msg: &TesterPresentControlMessage,
     ) -> Result<(), DiagServiceError> {
-        let payload = match control_msg.type_ {
-            TesterPresentType::Functional => {
-                let ecu = self
-                    .ecus
-                    .get(&control_msg.ecu)
-                    .ok_or(DiagServiceError::NotFound)?;
-                ServicePayload {
-                    data: vec![service_ids::TESTER_PRESENT, 0x80],
-                    source_address: ecu.read().await.tester_address(),
-                    target_address: ecu.read().await.logical_functional_address(),
-                    new_session_id: None,
-                    new_security_access_id: None,
-                }
+        let payload = {
+            let ecu = self
+                .ecus
+                .get(&control_msg.ecu)
+                .ok_or(DiagServiceError::NotFound(None))?;
+            let target_address = match &control_msg.type_ {
+                TesterPresentType::Functional(_) => ecu.read().await.logical_functional_address(),
+                TesterPresentType::Ecu(_) => ecu.read().await.logical_address(),
+            };
+            ServicePayload {
+                data: vec![service_ids::TESTER_PRESENT, 0x80],
+                source_address: ecu.read().await.tester_address(),
+                target_address,
+                new_session: None,
+                new_security: None,
             }
         };
 
@@ -570,7 +585,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
         service_types: Vec<DtcReadInformationFunction>,
         include_schema: bool,
     ) -> Result<(R, String, Option<SchemaDescription>), DiagServiceError> {
-        let ecu = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu = self.ecu_diag_service(ecu_name)?;
         let (_, extended_data_lookup) = ecu
             .read()
             .await
@@ -644,7 +659,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
 
         let schema = if include_schema {
             extract_schema_properties(&schema_desc.ok_or(DiagServiceError::InvalidRequest(
-                "Schema requested but not found".to_string(),
+                "Schema requested but not found".to_owned(),
             ))?)
         } else {
             None
@@ -661,7 +676,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                                 item.as_object().and_then(|obj| {
                                     let record = obj.iter().find_map(|(_, v)| v.as_object());
                                     let record_number = obj.iter().find_map(|(_, v)| {
-                                        if !v.is_object() { Some(v) } else { None }
+                                        if v.is_object() { None } else { Some(v) }
                                     });
 
                                     if let (Some(record_number), Some(record)) =
@@ -705,7 +720,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
             let mut schema = serde_json::Map::new();
 
             // Todo when solving #54: We are missing the mux case name in the schema.
-            for (key, value) in param_properties.iter() {
+            for (key, value) in param_properties {
                 if value.is_array() || value.get("type").is_some_and(|t| t == "integer") {
                     schema.insert(key.clone(), value.clone());
                 }
@@ -733,7 +748,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
 
         let schema = if include_schema {
             extract_schema_properties(&schema_desc.ok_or(DiagServiceError::InvalidRequest(
-                "Schema requested but not found".to_string(),
+                "Schema requested but not found".to_owned(),
             ))?)
         } else {
             None
@@ -748,7 +763,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
                 params
                     .iter()
                     .filter_map(|param| param.as_object())
-                    .flat_map(|obj| {
+                    .filter_map(|obj| {
                         let records = obj.values().find_map(|v| v.as_array());
                         let number_of_identifiers = obj.values().find_map(|v| v.as_number());
                         let record_number_of_snapshot = obj.values().find(|v| v.is_string());
@@ -784,6 +799,24 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsMana
             }),
             schema,
         ))
+    }
+
+    async fn ecus_for_functional_group(&self, functional_group: &str) -> Vec<String> {
+        let mut ecu_names = Vec::new();
+        for (name, ecu) in self.ecus.iter() {
+            let ecu_guard = ecu.read().await;
+            if ecu_guard.logical_address() != ecu_guard.logical_gateway_address() {
+                continue; // skip non gateway ECUs
+            }
+            if !ecu_guard
+                .functional_groups()
+                .contains(&functional_group.to_owned())
+            {
+                continue; // skip ECUs not in the functional group
+            }
+            ecu_names.push(name.clone());
+        }
+        ecu_names
     }
 }
 
@@ -828,6 +861,8 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
 
         for ecu in self.ecus.values() {
             let ecu = ecu.read().await;
+            let ecu_name = ecu.ecu_name();
+
             let variant = ecu
                 .variant_name()
                 .unwrap_or_else(|| "BaseVariant".to_owned());
@@ -853,7 +888,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
 
             if gateway_addr == ecu.logical_address() {
                 // this is the gateway itself
-                gateway.name.clone_from(&ecu.ecu_name());
+                gateway.name.clone_from(&ecu_name);
                 gateway.logical_address.clone_from(&logical_address_string);
                 if let Some(gateway_network_address) =
                     self.gateway.get_gateway_network_address(gateway_addr).await
@@ -861,7 +896,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                     gateway.network_address = gateway_network_address;
                 } else {
                     tracing::warn!(
-                        gateway_name = %ecu.ecu_name(),
+                        gateway_name = %ecu_name,
                         logical_address = %logical_address_string,
                         "No IP address found for gateway"
                     );
@@ -869,11 +904,11 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             }
 
             gateway.ecus.push(Ecu {
-                qualifier: ecu.ecu_name(),
+                qualifier: ecu_name.clone(),
                 variant: variant.clone(),
                 state: ecu.state().to_string(),
                 logical_address: logical_address_string,
-                logical_link: format!("{}_on_{}", ecu.ecu_name(), ecu.protocol().value()),
+                logical_link: format!("{}_on_{}", ecu_name, ecu.protocol().value()),
             });
         }
 
@@ -893,9 +928,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         tracing::trace!(ecu_name = %ecu_name, payload = ?payload, "Sending raw UDS packet");
 
         let payload = self
-            .ecus
-            .get(ecu_name)
-            .ok_or(DiagServiceError::NotFound)?
+            .ecu_diag_service(ecu_name)?
             .read()
             .await
             .check_genericservice(security_plugin, payload)?;
@@ -913,37 +946,32 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         &self,
         ecu_name: &str,
         service: Option<&DiagComm>,
-    ) -> Result<Vec<cda_interfaces::datatypes::SdSdg>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::SdSdg>, DiagServiceError> {
         match self.ecus.get(ecu_name) {
             Some(ecu) => {
                 let ecu = ecu.read().await;
-                ecu.sdgs(service)
-                    .map_err(|e| format!("Failed to get SDGs for ECU {ecu_name}: {e:?}"))
+                ecu.sdgs(service).await
             }
-            None => Err("ECU not found".to_owned()),
+            None => Err(DiagServiceError::NotFound(Some("ECU not found".to_owned()))),
         }
     }
 
     async fn get_comparams(
         &self,
         ecu: &str,
-    ) -> Result<cda_interfaces::datatypes::ComplexComParamValue, String> {
-        let ecu = self
-            .ecus
-            .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?;
-        let comparams = ecu.read().await.comparams();
-        Ok(comparams)
+    ) -> Result<cda_interfaces::datatypes::ComplexComParamValue, DiagServiceError> {
+        let ecu = self.ecus.get(ecu).ok_or(DiagServiceError::NotFound(None))?;
+        ecu.read().await.comparams()
     }
 
     async fn get_components_data_info(
         &self,
         ecu: &str,
-    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, DiagServiceError> {
         let items = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?
+            .ok_or_else(|| DiagServiceError::NotFound(Some(format!("Unknown ECU: {ecu}"))))?
             .read()
             .await
             .get_components_data_info();
@@ -957,7 +985,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     ) -> Result<Vec<ComponentConfigurationsInfo>, DiagServiceError> {
         self.ecus
             .get(ecu)
-            .ok_or(DiagServiceError::NotFound)?
+            .ok_or(DiagServiceError::NotFound(None))?
             .read()
             .await
             .get_components_configurations_info()
@@ -966,11 +994,11 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     async fn get_components_single_ecu_jobs_info(
         &self,
         ecu: &str,
-    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, String> {
+    ) -> Result<Vec<cda_interfaces::datatypes::ComponentDataInfo>, DiagServiceError> {
         let items = self
             .ecus
             .get(ecu)
-            .ok_or_else(|| format!("Unknown ECU: {ecu}"))?
+            .ok_or_else(|| DiagServiceError::NotFound(Some(format!("Unknown ECU: {ecu}"))))?
             .read()
             .await
             .get_components_single_ecu_jobs_info();
@@ -985,7 +1013,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     ) -> Result<cda_interfaces::datatypes::single_ecu::Job, DiagServiceError> {
         self.ecus
             .get(ecu)
-            .ok_or(DiagServiceError::NotFound)?
+            .ok_or(DiagServiceError::NotFound(None))?
             .read()
             .await
             .lookup_single_ecu_job(job_name)
@@ -1038,8 +1066,8 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         expiration: Duration,
     ) -> Result<Self::Response, DiagServiceError> {
         tracing::info!(ecu_name = %ecu_name, session = %session, "Setting session");
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
-        let (session_id, dc) = ecu_diag_service
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
+        let dc = ecu_diag_service
             .read()
             .await
             .lookup_session_change(session)?;
@@ -1048,7 +1076,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             DiagServiceResponseType::Positive => {
                 // update ecu DiagServiceManagers internal state.
                 let ecu = ecu_diag_service.read().await;
-                ecu.set_session(session_id, expiration)?;
+                ecu.set_session(session, expiration)?;
                 Ok(result)
             }
             DiagServiceResponseType::Negative => Ok(result),
@@ -1064,7 +1092,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         security_plugin: &DynamicPlugin,
         expiration: Duration,
     ) -> Result<(SecurityAccess, R), DiagServiceError> {
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
         let security_access = ecu_diag_service
             .read()
             .await
@@ -1075,7 +1103,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                 self.send(ecu_name, dc.clone(), security_plugin, None, false)
                     .await?,
             )),
-            SecurityAccess::SendKey((id, dc)) => {
+            SecurityAccess::SendKey(dc) => {
                 let result = self
                     .send(
                         ecu_name,
@@ -1089,7 +1117,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                     DiagServiceResponseType::Positive => {
                         // update ecu DiagServiceManagers internal state.
                         let ecu = ecu_diag_service.read().await;
-                        ecu.set_security_access(*id, expiration)?;
+                        ecu.set_security_access(level, expiration)?;
                         Ok((security_access, result))
                     }
                     DiagServiceResponseType::Negative => Ok((security_access, result)),
@@ -1098,16 +1126,35 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         }
     }
 
+    async fn get_send_key_param_name(
+        &self,
+        ecu_name: &str,
+        level: &str,
+    ) -> Result<String, DiagServiceError> {
+        let ecu_diag_service = self
+            .ecus
+            .get(ecu_name)
+            .ok_or(DiagServiceError::NotFound(None))?;
+        let security_access = ecu_diag_service
+            .read()
+            .await
+            .lookup_security_access_change(level, None, true)?;
+        match &security_access {
+            SecurityAccess::RequestSeed(_) => {
+                unreachable!("Not reached, because has key is set to true above")
+            }
+            SecurityAccess::SendKey(dc) => {
+                let ecu = ecu_diag_service.read().await;
+                ecu.get_send_key_param_name(dc).await
+            }
+        }
+    }
+
     async fn get_ecu_reset_services(
         &self,
         ecu_name: &str,
     ) -> Result<Vec<String>, DiagServiceError> {
-        let diag_manager = self
-            .ecus
-            .get(ecu_name)
-            .ok_or(DiagServiceError::NotFound)?
-            .read()
-            .await;
+        let diag_manager = self.ecu_diag_service(ecu_name)?.read().await;
 
         let reset_services = diag_manager.lookup_service_names_by_sid(service_ids::ECU_RESET)?;
         drop(diag_manager);
@@ -1115,15 +1162,15 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
     }
 
     async fn ecu_session(&self, ecu_name: &str) -> Result<String, DiagServiceError> {
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
         let ecu = ecu_diag_service.read().await;
-        Ok(ecu.session())
+        ecu.session()
     }
 
     async fn ecu_security_access(&self, ecu_name: &str) -> Result<String, DiagServiceError> {
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
         let ecu = ecu_diag_service.read().await;
-        Ok(ecu.security_access())
+        ecu.security_access()
     }
 
     async fn ecu_exec_service_from_function_class(
@@ -1134,7 +1181,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         security_plugin: &DynamicPlugin,
         data: UdsPayloadData,
     ) -> Result<R, DiagServiceError> {
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
         let ecu = ecu_diag_service.read().await;
         let request = ecu.lookup_service_through_func_class(func_class_name, service_id)?;
         self.send(ecu_name, request, security_plugin, Some(data), true)
@@ -1147,17 +1194,17 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         func_class_name: &str,
         service_id: u8,
     ) -> Result<DiagComm, DiagServiceError> {
-        let ecu_diag_service = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu_diag_service = self.ecu_diag_service(ecu_name)?;
         let ecu = ecu_diag_service.read().await;
         ecu.lookup_service_through_func_class(func_class_name, service_id)
     }
 
-    async fn ecu_flash_transfer_start<'a>(
+    async fn ecu_flash_transfer_start(
         &self,
         ecu_name: &str,
         func_class_name: &str,
         security_plugin: &DynamicPlugin,
-        parameters: FlashTransferStartParams<'a>,
+        parameters: FlashTransferStartParams<'_>,
     ) -> Result<(), DiagServiceError> {
         let FlashTransferStartParams {
             file_path,
@@ -1198,7 +1245,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
                 DiagServiceError::InvalidRequest(format!("Failed to seek to offset in file: {e:?}"))
             })?;
 
-        let ecu = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu = self.ecu_diag_service(ecu_name)?;
         let request = ecu
             .read()
             .await
@@ -1206,7 +1253,8 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
 
         ecu.read()
             .await
-            .is_service_allowed(&request, security_plugin)?;
+            .is_service_allowed(&request, security_plugin)
+            .await?;
 
         let ecu_name = ecu_name.to_owned();
         let ecu_name_clone = ecu_name.clone();
@@ -1220,7 +1268,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         let transfer_task =
             cda_interfaces::spawn_named!(&format!("flashtransfer-{ecu_name}"), async move {
                 uds.transfer_ecu_data(&ecu_name, length, request, sender, reader)
-                    .await
+                    .await;
             });
 
         transfer_lock.insert(
@@ -1240,9 +1288,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         id: &str,
     ) -> Result<(), DiagServiceError> {
         let mut lock = self.data_transfers.lock().await;
-        let transfer = lock.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let transfer = lock.get(ecu_name).ok_or(DiagServiceError::NotFound(None))?;
         if transfer.meta_data.id != id {
-            return Err(DiagServiceError::NotFound);
+            return Err(DiagServiceError::NotFound(None));
         }
 
         if !matches!(
@@ -1255,7 +1303,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             )));
         }
 
-        let mut transfer = lock.remove(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let mut transfer = lock
+            .remove(ecu_name)
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         if let Err(e) = transfer.status_receiver.changed().await {
             return Err(DiagServiceError::InvalidRequest(format!(
@@ -1280,7 +1330,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             .await
             .get(ecu_name)
             .map(|transfer| transfer.meta_data.clone())
-            .ok_or(DiagServiceError::NotFound)?;
+            .ok_or(DiagServiceError::NotFound(None))?;
 
         Ok(vec![meta_data.clone()])
     }
@@ -1294,15 +1344,12 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             .await?
             .into_iter()
             .find(|transfer| transfer.id == id)
-            .ok_or(DiagServiceError::NotFound)
+            .ok_or(DiagServiceError::NotFound(None))
     }
 
     #[tracing::instrument(skip(self), err)]
-    async fn detect_variant(&self, ecu_name: &str) -> Result<(), String> {
-        let ecu = self
-            .ecus
-            .get(ecu_name)
-            .ok_or_else(|| format!("Unknown ECU: {ecu_name}"))?;
+    async fn detect_variant(&self, ecu_name: &str) -> Result<(), DiagServiceError> {
+        let ecu = self.ecu_diag_service(ecu_name)?;
 
         let requests = ecu
             .read()
@@ -1310,33 +1357,24 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             .get_variant_detection_requests()
             .iter()
             .map(|req| {
-                let (name, type_) = req.split_once('_').unwrap();
-                let operation = match type_ {
-                    "Read" => DiagCommAction::Read,
-                    "Write" => DiagCommAction::Write,
-                    unknown => {
-                        return Err(format!(
-                            "Variant Detection for ECU {ecu_name} failed due to unknown operation \
-                             type {unknown}"
-                        ));
-                    }
-                };
+                let name = req
+                    .split_once('_')
+                    .map_or(req.as_str(), |(name, _)| name)
+                    .to_owned();
 
                 let service = DiagComm {
-                    name: name.to_owned(),
-                    action: operation,
+                    name: name.clone(),
                     type_: DiagCommType::Data,
                     lookup_name: None,
                 };
                 Ok((req.to_owned(), service))
             })
-            .collect::<Result<Vec<(String, DiagComm)>, String>>()?;
+            .collect::<Result<Vec<(String, DiagComm)>, DiagServiceError>>()?;
 
         if !ecu.read().await.is_loaded() {
-            ecu.write()
-                .await
-                .load()
-                .map_err(|e| format!("Failed to load ECU data: {e:?}"))?;
+            ecu.write().await.load().map_err(|e| {
+                DiagServiceError::ResourceError(format!("Failed to load ECU data: {e:?}"))
+            })?;
         }
 
         let mut service_responses = HashMap::new();
@@ -1370,16 +1408,16 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         ecu.write()
             .await
             .detect_variant(service_responses)
-            .map_err(|e| format!("Failed to detect variant: {e:?}"))?;
+            .await
+            .map_err(|e| {
+                DiagServiceError::VariantDetectionError(format!("Failed to detect variant: {e:?}"))
+            })?;
 
         Ok(())
     }
 
-    async fn get_variant(&self, ecu_name: &str) -> Result<String, String> {
-        let ecu = self
-            .ecus
-            .get(ecu_name)
-            .ok_or_else(|| format!("Unknown ECU: {ecu_name}"))?;
+    async fn get_variant(&self, ecu_name: &str) -> Result<String, DiagServiceError> {
+        let ecu = self.ecu_diag_service(ecu_name)?;
 
         let variant = ecu
             .read()
@@ -1404,7 +1442,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             ecus.push(ecu_name.to_owned());
         }
         let cloned = self.clone();
-        cloned.start_variant_detection_for_ecus(ecus)
+        cloned.start_variant_detection_for_ecus(ecus);
     }
 
     async fn ecu_dtc_by_mask(
@@ -1415,7 +1453,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
         severity: Option<u32>,
         scope: Option<String>,
     ) -> Result<HashMap<DtcCode, DtcRecordAndStatus>, DiagServiceError> {
-        let ecu = self.ecus.get(ecu_name).ok_or(DiagServiceError::NotFound)?;
+        let ecu = self.ecu_diag_service(ecu_name)?;
         let mut all_dtcs = HashMap::new();
         let scoped_services: Vec<_> = ecu
             .read()
@@ -1501,7 +1539,7 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             }
 
             if mask == 0xff || mask == 0x00 {
-                for record in lookup.dtcs.into_iter() {
+                for record in lookup.dtcs {
                     all_dtcs.entry(record.code).or_insert(DtcRecordAndStatus {
                         record,
                         scope: lookup.scope.clone(),
@@ -1560,6 +1598,105 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> UdsEcu
             snapshots,
             snapshots_schema: snapshot_schema,
         })
+    }
+
+    async fn start_tester_present(&self, type_: TesterPresentType) -> Result<(), DiagServiceError> {
+        match type_ {
+            TesterPresentType::Ecu(ref ecu_name) => {
+                let ecu = ecu_name.to_owned();
+                self.control_tester_present(TesterPresentControlMessage {
+                    mode: TesterPresentMode::Start,
+                    type_,
+                    ecu,
+                    interval: None,
+                })
+                .await
+            }
+            TesterPresentType::Functional(ref functional_group) => {
+                for name in self.ecus_for_functional_group(functional_group).await {
+                    if let Err(e) = self
+                        .control_tester_present(TesterPresentControlMessage {
+                            mode: TesterPresentMode::Start,
+                            type_: type_.clone(),
+                            ecu: name.clone(),
+                            interval: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            functional_group = %functional_group,
+                            ecu_name = %name,
+                            error = %e,
+                            "Failed to start tester present for ECU in functional group"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn stop_tester_present(&self, type_: TesterPresentType) -> Result<(), DiagServiceError> {
+        match type_ {
+            TesterPresentType::Ecu(ref ecu_name) => {
+                let ecu = ecu_name.to_owned();
+                self.control_tester_present(TesterPresentControlMessage {
+                    mode: TesterPresentMode::Stop,
+                    type_,
+                    ecu,
+                    interval: None,
+                })
+                .await
+            }
+            TesterPresentType::Functional(ref functional_group) => {
+                for name in self.ecus_for_functional_group(functional_group).await {
+                    if let Err(e) = self
+                        .control_tester_present(TesterPresentControlMessage {
+                            mode: TesterPresentMode::Stop,
+                            type_: type_.clone(),
+                            ecu: name.clone(),
+                            interval: None,
+                        })
+                        .await
+                    {
+                        tracing::warn!(
+                            functional_group = %functional_group,
+                            ecu_name = %name,
+                            error = %e,
+                            "Failed to stop tester present for ECU in functional group"
+                        );
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn check_tester_present_active(&self, type_: &TesterPresentType) -> bool {
+        match type_ {
+            TesterPresentType::Ecu(ecu_name) => {
+                let tester_presents = self.tester_present_tasks.read().await;
+                tester_presents.get(ecu_name).is_some()
+            }
+            TesterPresentType::Functional(functional_group) => {
+                let ecu_names = self.ecus_for_functional_group(functional_group).await;
+                let tester_presents = self.tester_present_tasks.read().await;
+                ecu_names
+                    .iter()
+                    .all(|ecu| tester_presents.get(ecu).is_some())
+            }
+        }
+    }
+
+    async fn ecu_functional_groups(&self, ecu_name: &str) -> Result<Vec<String>, DiagServiceError> {
+        let groups = self
+            .ecus
+            .get(ecu_name)
+            .ok_or(DiagServiceError::NotFound(None))?
+            .read()
+            .await
+            .functional_groups();
+        Ok(groups)
     }
 }
 
@@ -1642,9 +1779,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> SchemaP
         service: &DiagComm,
     ) -> Result<cda_interfaces::SchemaDescription, DiagServiceError> {
         let Some(ecu) = self.ecus.get(ecu) else {
-            return Err(DiagServiceError::NotFound);
+            return Err(DiagServiceError::NotFound(None));
         };
-        ecu.read().await.schema_for_request(service)
+        ecu.read().await.schema_for_request(service).await
     }
 
     async fn schema_for_responses(
@@ -1653,9 +1790,9 @@ impl<S: EcuGateway, R: DiagServiceResponse, T: EcuManager<Response = R>> SchemaP
         service: &DiagComm,
     ) -> Result<cda_interfaces::SchemaDescription, DiagServiceError> {
         let Some(ecu) = self.ecus.get(ecu) else {
-            return Err(DiagServiceError::NotFound);
+            return Err(DiagServiceError::NotFound(None));
         };
-        ecu.read().await.schema_for_responses(service)
+        ecu.read().await.schema_for_responses(service).await
     }
 }
 

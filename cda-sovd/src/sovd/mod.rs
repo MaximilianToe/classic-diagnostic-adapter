@@ -14,7 +14,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use aide::{
-    axum::{ApiRouter as Router, routing},
+    axum::{ApiRouter as Router, ApiRouter, routing},
     transform::TransformOperation,
 };
 use axum::{
@@ -82,28 +82,30 @@ impl<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManager> Clone
         Self {
             ecu_name: self.ecu_name.clone(),
             uds: self.uds.clone(),
-            locks: self.locks.clone(),
-            comparam_executions: self.comparam_executions.clone(),
-            flash_data: self.flash_data.clone(),
-            mdd_embedded_files: self.mdd_embedded_files.clone(),
+            locks: Arc::clone(&self.locks),
+            comparam_executions: Arc::clone(&self.comparam_executions),
+            flash_data: Arc::clone(&self.flash_data),
+            mdd_embedded_files: Arc::clone(&self.mdd_embedded_files),
             _phantom: std::marker::PhantomData::<R>,
         }
     }
 }
 
-pub(crate) struct WebserverState {
+pub(crate) struct WebserverState<T: UdsEcu + Clone> {
+    uds: T,
     locks: Arc<Locks>,
     flash_data: Arc<RwLock<sovd_interfaces::sovd2uds::FileList>>,
 }
 
-/// Clone implementation that does not clone the auth_state
-/// auth_state is only set by the middleware and should not
+/// Clone implementation that does not clone the `auth_state`
+/// `auth_state` is only set by the middleware and should not
 /// be cloned for each request
-impl Clone for WebserverState {
+impl<T: UdsEcu + Clone> Clone for WebserverState<T> {
     fn clone(&self) -> Self {
         Self {
-            locks: self.locks.clone(),
-            flash_data: self.flash_data.clone(),
+            uds: self.uds.clone(),
+            locks: Arc::clone(&self.locks),
+            flash_data: Arc::clone(&self.flash_data),
         }
     }
 }
@@ -152,6 +154,7 @@ pub async fn route<
         schema: None,
     }));
     let state = WebserverState {
+        uds: uds.clone(),
         locks: Arc::new(Locks {
             vehicle: LockType::Vehicle(Arc::new(RwLock::new(None))),
             ecu: LockType::Ecu(Arc::new(RwLock::new(
@@ -217,6 +220,15 @@ pub async fn route<
         router = router.nest_api_service(&ecu_path, nested);
     }
 
+    vehicle_route::<T, S>(state, router)
+        .layer(middleware::from_fn(security_plugin_middleware::<S>))
+        .with_state(uds.clone())
+}
+
+fn vehicle_route<T: UdsEcu + SchemaProvider + Clone, S: SecurityPluginLoader>(
+    state: WebserverState<T>,
+    router: ApiRouter<WebserverState<T>>,
+) -> ApiRouter<T> {
     router
         .api_route(
             "/vehicle/v15/locks",
@@ -283,10 +295,10 @@ pub async fn route<
                 apps::sovd2uds::data::networkstructure::docs_get,
             ),
         )
-        .layer(middleware::from_fn(security_plugin_middleware::<S>))
-        .with_state(uds.clone())
 }
 
+// Disabled as for now it makes sense to keep the route creation together
+#[allow(clippy::too_many_lines)]
 fn ecu_route<
     R: DiagServiceResponse,
     T: UdsEcu + SchemaProvider + Clone,
@@ -294,7 +306,7 @@ fn ecu_route<
 >(
     ecu_name: &str,
     uds: &T,
-    state: &WebserverState,
+    state: &WebserverState<T>,
     flash_data: &Arc<RwLock<FileList>>,
     file_manager: &mut HashMap<String, U>,
 ) -> (String, Router) {
@@ -483,9 +495,8 @@ fn get_payload_data<'a, T>(
 where
     T: sovd_interfaces::Payload + serde::de::Deserialize<'a>,
 {
-    let content_type = match content_type {
-        Some(content_type) => content_type,
-        None => return Ok(None),
+    let Some(content_type) = content_type else {
+        return Ok(None);
     };
     Ok(match (content_type.type_(), content_type.subtype()) {
         (mime::APPLICATION, mime::JSON) => {
@@ -536,7 +547,7 @@ fn get_octet_stream_payload(
     Ok(Some(UdsPayloadData::Raw(data)))
 }
 
-/// Helper Fn to convert a serde_json::Value into a schemars::Schema, without cloning
+/// Helper Fn to convert a `serde_json::Value` into a `schemars::Schema`, without cloning
 fn value_to_schema(mut value: serde_json::Value) -> Result<Schema, ApiError> {
     let value = value
         .as_object_mut()

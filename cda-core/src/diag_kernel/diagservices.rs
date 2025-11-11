@@ -11,7 +11,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cda_database::datatypes::{CompuMethod, DataType};
+use cda_database::datatypes::{self, DataType};
 use cda_interfaces::{
     DiagComm, DiagServiceError,
     datatypes::{DtcField, DtcRecord},
@@ -58,7 +58,7 @@ pub struct DiagDataTypeContainerRaw {
     pub data: Vec<u8>,
     pub bit_len: usize,
     pub data_type: DataType,
-    pub compu_method: Option<CompuMethod>,
+    pub compu_method: Option<datatypes::CompuMethod>,
 }
 
 pub type MappedDiagServiceResponsePayload = HashMap<String, DiagDataTypeContainer>;
@@ -85,13 +85,15 @@ impl DiagServiceResponse for DiagServiceResponseStruct {
         self.serialize_to_json()
     }
 
-    fn as_nrc(&self) -> Result<MappedNRC, String> {
+    fn as_nrc(&self) -> Result<MappedNRC, DiagServiceError> {
         let Some(MappedResponseData {
             data: mapped_data,
             errors: _,
         }) = &self.mapped_data
         else {
-            return Err("Unexpected negative response from ECU".to_owned());
+            return Err(DiagServiceError::UnexpectedResponse(Some(
+                "Unexpected negative response from ECU".to_owned(),
+            )));
         };
         let nrc_code = mapped_data
             .get("NRC")
@@ -161,7 +163,7 @@ impl DiagServiceResponse for DiagServiceResponseStruct {
                         .collect::<Vec<_>>();
                     Some(results.into_iter().flatten().flatten().collect())
                 }
-                _ => None,
+                DiagDataTypeContainer::RawContainer(_) => None,
             }
         }
 
@@ -279,7 +281,7 @@ impl DiagServiceResponseStruct {
                             errors,
                             format!("{path}/{k}").as_str(),
                         ) {
-                            Ok(_) => DiagDataValue::Struct(nested_mapped),
+                            Ok(()) => DiagDataValue::Struct(nested_mapped),
                             Err(e) => {
                                 if let DiagServiceError::DataError(ref error) = e {
                                     errors.push(FieldParseError {
@@ -303,7 +305,7 @@ impl DiagServiceResponseStruct {
                                 errors,
                                 format!("{path}/{k}").as_str(),
                             ) {
-                                Ok(_) => nested_vec.push(inner_mapped),
+                                Ok(()) => nested_vec.push(inner_mapped),
                                 Err(e) => {
                                     if let DiagServiceError::DataError(ref error) = e {
                                         errors.push(FieldParseError {
