@@ -32,7 +32,9 @@ pub(crate) async fn get(
 }
 
 pub(crate) mod sovd2uds {
-    use super::*;
+    use super::{
+        ApiError, Host, OriginalUri, Query, Response, UseApi, WithRejection, resource_response,
+    };
 
     pub(crate) async fn get(
         UseApi(Host(host), _): UseApi<Host, String>,
@@ -46,7 +48,9 @@ pub(crate) mod sovd2uds {
     }
 
     pub(crate) mod bulk_data {
-        use super::*;
+        use super::{
+            ApiError, Host, OriginalUri, Query, Response, UseApi, WithRejection, resource_response,
+        };
 
         pub(crate) async fn get(
             UseApi(Host(host), _): UseApi<Host, String>,
@@ -74,6 +78,7 @@ pub(crate) mod sovd2uds {
                 response::{IntoResponse, Response},
             };
             use axum_extra::extract::WithRejection;
+            use cda_interfaces::UdsEcu;
             use http::StatusCode;
             use regex::Regex;
 
@@ -149,12 +154,12 @@ pub(crate) mod sovd2uds {
                     })
             }
 
-            pub(crate) async fn get(
+            pub(crate) async fn get<T: UdsEcu + Clone>(
                 WithRejection(Query(query), _): WithRejection<
                     Query<sovd_interfaces::IncludeSchemaQuery>,
                     ApiError,
                 >,
-                State(state): State<WebserverState>,
+                State(state): State<WebserverState<T>>,
             ) -> Response {
                 let include_schema = query.include_schema;
                 let flash_files = &mut state.flash_data.as_ref().write().await;
@@ -296,12 +301,12 @@ impl IntoSovd for cda_interfaces::datatypes::NetworkStructure {
             functional_groups: self
                 .functional_groups
                 .into_iter()
-                .map(|fg| fg.into_sovd())
+                .map(super::IntoSovd::into_sovd)
                 .collect(),
             gateways: self
                 .gateways
                 .into_iter()
-                .map(|gateway| gateway.into_sovd())
+                .map(super::IntoSovd::into_sovd)
                 .collect(),
         }
     }
@@ -315,7 +320,11 @@ impl IntoSovd for cda_interfaces::datatypes::Gateway {
             name: self.name,
             network_address: self.network_address,
             logical_address: self.logical_address,
-            ecus: self.ecus.into_iter().map(|ecu| ecu.into_sovd()).collect(),
+            ecus: self
+                .ecus
+                .into_iter()
+                .map(super::IntoSovd::into_sovd)
+                .collect(),
         }
     }
 }
@@ -326,7 +335,11 @@ impl IntoSovd for cda_interfaces::datatypes::FunctionalGroup {
     fn into_sovd(self) -> Self::SovdType {
         Self::SovdType {
             qualifier: self.qualifier,
-            ecus: self.ecus.into_iter().map(|ecu| ecu.into_sovd()).collect(),
+            ecus: self
+                .ecus
+                .into_iter()
+                .map(super::IntoSovd::into_sovd)
+                .collect(),
         }
     }
 }

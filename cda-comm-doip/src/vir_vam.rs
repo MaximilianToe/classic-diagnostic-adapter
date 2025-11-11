@@ -13,7 +13,7 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use cda_interfaces::{DoipComParamProvider, EcuAddressProvider, TesterPresentControlMessage};
+use cda_interfaces::{DiagServiceError, DoipComParamProvider, EcuAddressProvider};
 use doip_definitions::{
     header::PayloadType,
     payload::{DoipPayload, VehicleIdentificationRequest},
@@ -24,14 +24,13 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::{DoipDiagGateway, DoipTarget, connections::handle_gateway_connection};
 
-#[tracing::instrument(skip(socket, ecus, shutdown_signal), fields(gateway_port))]
 pub(crate) async fn get_vehicle_identification<T, F>(
     socket: &mut UdpSocket,
     netmask: u32,
     gateway_port: u16,
     ecus: &Arc<HashMap<String, RwLock<T>>>,
     shutdown_signal: F,
-) -> Result<Vec<DoipTarget>, String>
+) -> Result<Vec<DoipTarget>, DiagServiceError>
 where
     T: EcuAddressProvider,
     F: Future<Output = ()> + Clone + Send + 'static,
@@ -44,10 +43,10 @@ where
             DoipPayload::VehicleIdentificationRequest(VehicleIdentificationRequest {}),
             format!("{broadcast_ip}:{gateway_port}")
                 .parse()
-                .map_err(|_| "Invalid port")?,
+                .map_err(|_| DiagServiceError::SendFailed("Invalid port".to_owned()))?,
         )
         .await
-        .map_err(|e| format!("Failed to send VIR: {e:?}"))?;
+        .map_err(|e| DiagServiceError::SendFailed(format!("Failed to send VIR: {e:?}")))?;
 
     let mut gateways = Vec::new();
 
@@ -71,8 +70,10 @@ where
                             Err(e) => tracing::error!(error = ?e, "Failed to handle VAM"),
                         }
                     }
-                    Ok(Some(Err(e))) => return Err(format!("Failed to receive VAMs: {e:?}")),
-                    Ok(None) => return Err("Gateway closed connection".to_owned()),
+                    Ok(Some(Err(e))) => return Err(DiagServiceError::UnexpectedResponse(Some(
+                        format!("Failed to receive VAMs: {e:?}"))
+                    )),
+                    Ok(None) => return Err(DiagServiceError::ConnectionClosed),
                     Err(_) => {
                         // no VAM received within timeout
                         break;
@@ -88,7 +89,6 @@ pub(crate) async fn listen_for_vams<T, F>(
     netmask: u32,
     gateway: DoipDiagGateway<T>,
     variant_detection: mpsc::Sender<Vec<String>>,
-    tester_present: mpsc::Sender<TesterPresentControlMessage>,
     shutdown_signal: F,
 ) where
     T: EcuAddressProvider + DoipComParamProvider,
@@ -108,7 +108,6 @@ pub(crate) async fn listen_for_vams<T, F>(
         gateway_ecu_map: &HashMap<u16, Vec<u16>>,
         gateway_ecu_name_map: &HashMap<u16, Vec<String>>,
         variant_detection: mpsc::Sender<Vec<String>>,
-        tester_present: mpsc::Sender<TesterPresentControlMessage>,
     ) {
         let DoipMessageContext {
             doip_msg,
@@ -136,7 +135,6 @@ pub(crate) async fn listen_for_vams<T, F>(
                         &gateway.doip_connections,
                         &gateway.ecus,
                         gateway_ecu_map,
-                        tester_present,
                     )
                     .await
                     {
@@ -178,6 +176,8 @@ pub(crate) async fn listen_for_vams<T, F>(
     let mut gateway_ecu_name_map: HashMap<u16, Vec<String>> = HashMap::new();
     for ecu_lock in gateway.ecus.values() {
         let ecu = ecu_lock.read().await;
+        let ecu_name = ecu.ecu_name();
+
         let addr = ecu.logical_address();
         let gateway = ecu.logical_gateway_address();
         gateway_ecu_map
@@ -187,7 +187,7 @@ pub(crate) async fn listen_for_vams<T, F>(
         gateway_ecu_name_map
             .entry(gateway)
             .or_insert_with(Vec::new)
-            .push(ecu.ecu_name().to_lowercase());
+            .push(ecu_name.to_lowercase());
     }
 
     tracing::info!("Listening for spontaneous VAMs");
@@ -207,7 +207,6 @@ pub(crate) async fn listen_for_vams<T, F>(
                             handle_doip_response(
                                 &gateway, DoipMessageContext { doip_msg, source_addr, netmask },
                                 &gateway_ecu_map, &gateway_ecu_name_map, variant_detection.clone(),
-                                tester_present.clone(),
                             ).await;
                         }
                     }

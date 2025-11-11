@@ -29,6 +29,7 @@ pub struct SchemaDescription {
 }
 
 impl SchemaDescription {
+    #[must_use]
     pub fn new(name: String, title: String, schema: Option<schemars::Schema>) -> Self {
         Self {
             name,
@@ -36,19 +37,24 @@ impl SchemaDescription {
             schema,
         }
     }
+    #[must_use]
     pub fn title(&self) -> &str {
         &self.title
     }
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
+    #[must_use]
     pub fn schema(&self) -> Option<&schemars::Schema> {
         self.schema.as_ref()
     }
+    #[must_use]
     pub fn into_schema(self) -> Option<schemars::Schema> {
         self.schema
     }
 
+    #[must_use]
     pub fn get_param_properties(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
         let properties = self.schema()?;
 
@@ -76,13 +82,15 @@ fn schema_find_recursive<'a>(
 }
 
 pub trait EcuSchemaProvider {
-    fn schema_for_request(&self, service: &DiagComm)
-    -> Result<SchemaDescription, DiagServiceError>;
+    fn schema_for_request(
+        &self,
+        service: &DiagComm,
+    ) -> impl Future<Output = Result<SchemaDescription, DiagServiceError>> + Send;
 
     fn schema_for_responses(
         &self,
         service: &DiagComm,
-    ) -> Result<SchemaDescription, DiagServiceError>;
+    ) -> impl Future<Output = Result<SchemaDescription, DiagServiceError>> + Send;
 }
 
 pub trait SchemaProvider {

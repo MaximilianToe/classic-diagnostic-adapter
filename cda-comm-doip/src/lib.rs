@@ -12,19 +12,21 @@
  */
 
 use std::{
-    fmt::Display,
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use cda_interfaces::{
-    DiagServiceError, DoipComParamProvider, EcuAddressProvider, EcuGateway, ServicePayload,
-    TesterPresentControlMessage, TransmissionParameters, UdsResponse,
+    DiagServiceError, DoipComParamProvider, DoipGatewaySetupError, EcuAddressProvider, EcuGateway,
+    ServicePayload, TransmissionParameters, UdsResponse,
 };
 use doip_definitions::payload::{DiagnosticMessage, DiagnosticMessageNack, GenericNack};
 use hashbrown::HashMap;
+use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+
+use crate::connections::EcuError;
 
 mod connections;
 mod ecu_connection;
@@ -65,7 +67,7 @@ struct DoipTarget {
 
 struct DoipEcu {
     sender: mpsc::Sender<DiagnosticMessage>,
-    receiver: broadcast::Receiver<Result<DiagnosticResponse, String>>,
+    receiver: broadcast::Receiver<Result<DiagnosticResponse, EcuError>>,
 }
 
 struct DoipConnection {
@@ -73,21 +75,20 @@ struct DoipConnection {
     ip: String,
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug, Clone)]
 enum ConnectionError {
+    #[error("Connection closed.")]
     Closed,
+    #[error("Decoding error: `{0}`")]
     Decoding(String),
+    #[error("Invalid message: `{0}")]
     InvalidMessage(String),
-}
-
-impl Display for ConnectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionError::Closed => write!(f, "Connection closed"),
-            ConnectionError::Decoding(e) => write!(f, "Decoding error: {e}"),
-            ConnectionError::InvalidMessage(e) => write!(f, "Invalid message: {e}"),
-        }
-    }
+    #[error("Connection timeout: `{0}`")]
+    Timeout(String),
+    #[error("Connection failed: `{0}`")]
+    ConnectionFailed(String),
+    #[error("Routing error: `{0}`")]
+    RoutingError(String),
 }
 
 impl TryFrom<DiagnosticResponse> for Option<UdsResponse> {
@@ -99,8 +100,8 @@ impl TryFrom<DiagnosticResponse> for Option<UdsResponse> {
                 data: msg.message,
                 source_address: u16::from_be_bytes(msg.source_address),
                 target_address: u16::from_be_bytes(msg.target_address),
-                new_session_id: None,
-                new_security_access_id: None,
+                new_session: None,
+                new_security: None,
             }))),
             DiagnosticResponse::Pending(addr) => Ok(Some(UdsResponse::ResponsePending(addr))),
             DiagnosticResponse::BusyRepeatRequest(addr) => {
@@ -114,15 +115,18 @@ impl TryFrom<DiagnosticResponse> for Option<UdsResponse> {
             }
             _ => Err(DiagServiceError::BadPayload(
                 "Unexpected response type for DiagnosticResponse to UdsResponse conversion"
-                    .to_string(),
+                    .to_owned(),
             )),
         }
     }
 }
 
 impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
+    /// Create a new `DoipDiagGateway` instance.
+    /// # Errors
+    /// Returns `String` if initialization fails, e.g. when socket creation fails.
     #[tracing::instrument(
-        skip(ecus, variant_detection, tester_present, shutdown_signal),
+        skip(ecus, variant_detection, shutdown_signal),
         fields(tester_ip, gateway_port, ecu_count = ecus.len())
     )]
     pub async fn new<F>(
@@ -131,9 +135,8 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
         gateway_port: u16,
         ecus: Arc<HashMap<String, RwLock<T>>>,
         variant_detection: mpsc::Sender<Vec<String>>,
-        tester_present: mpsc::Sender<TesterPresentControlMessage>,
         shutdown_signal: F,
-    ) -> Result<Self, String>
+    ) -> Result<Self, DoipGatewaySetupError>
     where
         F: Future<Output = ()> + Clone + Send + 'static,
     {
@@ -149,7 +152,12 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
             &ecus,
             shutdown_signal.clone(),
         )
-        .await?;
+        .await
+        .map_err(|err| {
+            DoipGatewaySetupError::ResourceError(format!(
+                "Could not get vehicle identification. {err}"
+            ))
+        })?;
 
         let gateway = if gateways.is_empty() {
             DoipDiagGateway {
@@ -183,7 +191,6 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
                     &doip_connections,
                     &ecus,
                     &gateway_ecu_map,
-                    tester_present.clone(),
                 )
                 .await
                 {
@@ -200,14 +207,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
             }
         };
 
-        vir_vam::listen_for_vams(
-            mask,
-            gateway.clone(),
-            variant_detection,
-            tester_present,
-            shutdown_signal,
-        )
-        .await;
+        vir_vam::listen_for_vams(mask, gateway.clone(), variant_detection, shutdown_signal).await;
 
         Ok(gateway)
     }
@@ -241,7 +241,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> DoipDiagGateway<T> {
         }
 
         Err(DiagServiceError::EcuOffline(
-            transmission_params.ecu_name.to_string(),
+            transmission_params.ecu_name.clone(),
         ))
     }
 }
@@ -256,6 +256,9 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
             .map(|conn| conn.ip.clone())
     }
 
+    // most of this function is handling different error cases and timeouts.
+    // it is easier to comprehend when kept together.
+    #[allow(clippy::too_many_lines)]
     async fn send(
         &self,
         transmission_params: TransmissionParameters,
@@ -269,7 +272,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
             .read()
             .await
             .get(&transmission_params.gateway_address)
-            .ok_or_else(|| DiagServiceError::EcuOffline(transmission_params.ecu_name.to_owned()))?;
+            .ok_or_else(|| DiagServiceError::EcuOffline(transmission_params.ecu_name.clone()))?;
 
         if conn_idx >= self.doip_connections.read().await.len() {
             return Err(DiagServiceError::ConnectionClosed);
@@ -296,7 +299,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
 
                     // Clear any pending messages
                     while ecu.receiver.try_recv().is_ok() {}
-                    let receiver_flushed = start.elapsed() - lock_acquired;
+                    let receiver_flushed = start.elapsed().saturating_sub(lock_acquired);
 
                     let mut resend_counter = 0;
                     if let Err(e) = send_with_retries(
@@ -343,7 +346,7 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
                                 // before sending anything else.
                                 try_send_uds_response(
                                     &response_sender,
-                                    Err(DiagServiceError::UnexpectedResponse),
+                                    Err(DiagServiceError::UnexpectedResponse(None)),
                                 )
                                 .await;
                                 return;
@@ -378,7 +381,10 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
                         }
                     }
 
-                    let send_and_ackd_after = start.elapsed() - lock_acquired - receiver_flushed;
+                    let send_and_ackd_after = start
+                        .elapsed()
+                        .saturating_sub(lock_acquired)
+                        .saturating_sub(receiver_flushed);
                     if !expect_uds_reply {
                         try_send_uds_response(&response_sender, Ok(None)).await;
                     }
@@ -389,43 +395,43 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
                     loop {
                         tokio::select! {
                             res = ecu.receiver.recv() => {
-                                match res {
-                                    Ok(res) => match res {
-                                        Ok(response) => {
-                                            if !try_send_uds_response(
-                                                &response_sender, response.try_into()).await {
-                                                break;
-                                            }
+                                if let Ok(res) = res { match res {
+                                    Ok(response) => {
+                                        if !try_send_uds_response(
+                                            &response_sender, response.try_into()).await {
+                                            break;
                                         }
-                                        Err(e) => {
-                                            if !try_send_uds_response(
-                                                    &response_sender,
-                                                    Err(DiagServiceError::NoResponse(
-                                                        format!(
-                                                            "Error while waiting for message, {e}")
-                                                ))).await {
-                                                break;
-                                            }
-                                        }
-                                    },
-                                    Err(_) => {
-                                        try_send_uds_response(&response_sender,
-                                            Err(DiagServiceError::NoResponse(
-                                                "ECU receiver unexpectedly closed".to_owned(),
-                                        ))).await;
-                                        break;
                                     }
+                                    Err(e) => {
+                                        if !try_send_uds_response(
+                                                &response_sender,
+                                                Err(DiagServiceError::NoResponse(
+                                                    format!(
+                                                        "Error while waiting for message, {e}")
+                                            ))).await {
+                                            break;
+                                        }
+                                    }
+                                } } else {
+                                    try_send_uds_response(&response_sender,
+                                        Err(DiagServiceError::NoResponse(
+                                            "ECU receiver unexpectedly closed".to_owned(),
+                                    ))).await;
+                                    break;
                                 }
                             }
-                            _ = response_sender.closed() => {
+                            () = response_sender.closed() => {
                                 tracing::debug!("Response sender closed, aborting loop");
                                 break;
                             }
                         }
                     }
 
-                    let rx_done =
-                        start.elapsed() - lock_acquired - send_and_ackd_after - receiver_flushed;
+                    let rx_done = start
+                        .elapsed()
+                        .saturating_sub(lock_acquired)
+                        .saturating_sub(send_and_ackd_after)
+                        .saturating_sub(receiver_flushed);
                     tracing::debug!(
                         total_duration = ?start.elapsed(),
                         lock_duration = ?lock_acquired,
@@ -457,18 +463,22 @@ impl<T: EcuAddressProvider + DoipComParamProvider> EcuGateway for DoipDiagGatewa
         doip_conn
             .ecus
             .get(&ecu_lock.logical_address())
-            .ok_or_else(|| DiagServiceError::EcuOffline(ecu_name.to_string()))?;
+            .ok_or_else(|| DiagServiceError::EcuOffline(ecu_name.to_owned()))?;
         Ok(())
     }
 }
 
-fn create_netmask(tester_ip: &str, tester_subnet: &str) -> Result<u32, String> {
-    let ip = tester_ip
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|e| format!("DoipGateway: Failed to parse tester IP address: {e:?}"))?;
-    let subnet = tester_subnet
-        .parse::<std::net::Ipv4Addr>()
-        .map_err(|e| format!("DoipGateway: Failed to parse tester subnet mask: {e:?}"))?;
+fn create_netmask(tester_ip: &str, tester_subnet: &str) -> Result<u32, DoipGatewaySetupError> {
+    let ip = tester_ip.parse::<std::net::Ipv4Addr>().map_err(|e| {
+        DoipGatewaySetupError::InvalidAddress(format!(
+            "DoipGateway: Failed to parse tester IP address: {e:?}"
+        ))
+    })?;
+    let subnet = tester_subnet.parse::<std::net::Ipv4Addr>().map_err(|e| {
+        DoipGatewaySetupError::InvalidAddress(format!(
+            "DoipGateway: Failed to parse tester subnet mask: {e:?}"
+        ))
+    })?;
 
     Ok(ip.to_bits() & subnet.to_bits())
 }
@@ -476,51 +486,71 @@ fn create_netmask(tester_ip: &str, tester_subnet: &str) -> Result<u32, String> {
 fn create_socket(
     tester_ip: &str,
     gateway_port: u16,
-) -> Result<doip_sockets::udp::UdpSocket, String> {
+) -> Result<doip_sockets::udp::UdpSocket, DoipGatewaySetupError> {
     let tester_ip = match tester_ip {
         "127.0.0.1" => "0.0.0.0",
         _ => tester_ip,
     };
-    let broadcast_addr: std::net::SocketAddr = format!("{tester_ip}:{gateway_port}")
-        .parse()
-        .map_err(|e| format!("DoipGateway: Failed to create broadcast addr: {e:?}"))?;
+    let broadcast_addr: std::net::SocketAddr =
+        format!("{tester_ip}:{gateway_port}").parse().map_err(|e| {
+            DoipGatewaySetupError::InvalidAddress(format!(
+                "DoipGateway: Failed to create broadcast addr: {e:?}"
+            ))
+        })?;
 
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
-    .map_err(|e| format!("DoipGateway: Failed to create socket: {e:?}"))?;
+    .map_err(|e| {
+        DoipGatewaySetupError::SocketCreationFailed(format!(
+            "DoipGateway: Failed to create socket: {e:?}"
+        ))
+    })?;
 
-    socket
-        .set_reuse_address(true)
-        .map_err(|e| format!("DoipGateway: Failed to set reuse address: {e:?}"))?;
+    socket.set_reuse_address(true).map_err(|e| {
+        DoipGatewaySetupError::InvalidAddress(format!(
+            "DoipGateway: Failed to set reuse address: {e:?}"
+        ))
+    })?;
     #[cfg(target_family = "unix")]
-    socket
-        .set_reuse_port(true)
-        .map_err(|e| format!("DoipGateway: Failed to set reuse port: {e:?}"))?;
-    socket
-        .set_broadcast(true)
-        .map_err(|e| format!("DoipGateway: Failed to set broadcast flag on socket: {e:?}"))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|e| format!("DoipGateway: Failed to set non-blocking mode: {e:?}"))?;
+    socket.set_reuse_port(true).map_err(|e| {
+        DoipGatewaySetupError::PortBindFailed(format!(
+            "DoipGateway: Failed to set reuse port: {e:?}"
+        ))
+    })?;
+    socket.set_broadcast(true).map_err(|e| {
+        DoipGatewaySetupError::SocketCreationFailed(format!(
+            "DoipGateway: Failed to set broadcast flag on socket: {e:?}"
+        ))
+    })?;
+    socket.set_nonblocking(true).map_err(|e| {
+        DoipGatewaySetupError::InvalidConfiguration(format!(
+            "DoipGateway: Failed to set non-blocking mode: {e:?}"
+        ))
+    })?;
 
-    socket
-        .bind(&broadcast_addr.into())
-        .map_err(|e| format!("DoipGateway: Failed to bind socket: {e:?}"))?;
+    socket.bind(&broadcast_addr.into()).map_err(|e| {
+        DoipGatewaySetupError::SocketCreationFailed(format!(
+            "DoipGateway: Failed to bind socket, ip {tester_ip}: {e:?}"
+        ))
+    })?;
 
     let std_sock: std::net::UdpSocket = socket.into();
-    doip_sockets::udp::UdpSocket::from_std(std_sock)
-        .map_err(|e| format!("DoipGateway: Failed to create DoIP socket from std socket: {e:?}"))
+    doip_sockets::udp::UdpSocket::from_std(std_sock).map_err(|e| {
+        DoipGatewaySetupError::SocketCreationFailed(format!(
+            "DoipGateway: Failed to create DoIP socket from std socket: {e:?}"
+        ))
+    })
 }
 
 impl<T: EcuAddressProvider + DoipComParamProvider> Clone for DoipDiagGateway<T> {
     fn clone(&self) -> Self {
         Self {
-            doip_connections: self.doip_connections.clone(),
-            logical_address_to_connection: self.logical_address_to_connection.clone(),
-            ecus: self.ecus.clone(),
+            doip_connections: Arc::clone(&self.doip_connections),
+            logical_address_to_connection: Arc::clone(&self.logical_address_to_connection),
+            ecus: Arc::clone(&self.ecus),
             socket: Arc::clone(&self.socket),
         }
     }

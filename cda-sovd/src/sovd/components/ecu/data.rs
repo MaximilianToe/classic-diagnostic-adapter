@@ -13,7 +13,10 @@
 
 use sovd_interfaces::error::ApiErrorResponse;
 
-use super::*;
+use super::{
+    ApiError, DiagServiceResponse, ErrorWrapper, FileManager, IntoResponse, Json, Query, Response,
+    State, StatusCode, TransformOperation, UdsEcu, WebserverEcuState, WithRejection,
+};
 use crate::sovd::{self, create_schema};
 
 pub(crate) async fn get<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManager>(
@@ -33,13 +36,16 @@ pub(crate) async fn get<R: DiagServiceResponse, T: UdsEcu + Clone, U: FileManage
     match uds.get_components_data_info(&ecu_name).await {
         Ok(mut items) => {
             let sovd_component_data = sovd_interfaces::components::ecu::data::get::Response {
-                items: items.drain(0..).map(|info| info.into_sovd()).collect(),
+                items: items
+                    .drain(0..)
+                    .map(crate::sovd::IntoSovd::into_sovd)
+                    .collect(),
                 schema,
             };
             (StatusCode::OK, Json(sovd_component_data)).into_response()
         }
         Err(e) => ErrorWrapper {
-            error: ApiError::BadRequest(e),
+            error: e.into(),
             include_schema: query.include_schema,
         }
         .into_response(),
@@ -88,8 +94,8 @@ pub(crate) mod diag_service {
     };
     use axum_extra::extract::WithRejection;
     use cda_interfaces::{
-        DiagComm, DiagCommAction, DiagCommType, SchemaProvider, UdsEcu,
-        diagservices::DiagServiceResponse, file_manager::FileManager,
+        DiagComm, DiagCommType, SchemaProvider, UdsEcu, diagservices::DiagServiceResponse,
+        file_manager::FileManager,
     };
     use cda_plugin_security::Secured;
     use hashbrown::HashMap;
@@ -114,19 +120,16 @@ pub(crate) mod diag_service {
         let service_ops = vec![
             DiagComm {
                 name: service.clone(),
-                action: DiagCommAction::Read,
                 type_: DiagCommType::Data,
                 lookup_name: None,
             },
             DiagComm {
                 name: service.clone(),
-                action: DiagCommAction::Write,
                 type_: DiagCommType::Data,
                 lookup_name: None,
             },
             DiagComm {
                 name: service,
-                action: DiagCommAction::Start,
                 type_: DiagCommType::Data,
                 lookup_name: None,
             },
@@ -149,7 +152,7 @@ pub(crate) mod diag_service {
                         continue;
                     }
                     resp.items.insert(
-                        format!("{}_{:?}", service.name, service.action).to_lowercase(),
+                        format!("{}_{:?}", service.name, service.action()).to_lowercase(),
                         sovd_interfaces::components::ecu::ServiceSdgs {
                             sdgs: sdgs.into_sovd(),
                         },
@@ -157,7 +160,7 @@ pub(crate) mod diag_service {
                 }
                 Err(e) => {
                     return ErrorWrapper {
-                        error: ApiError::BadRequest(e),
+                        error: e.into(),
                         include_schema,
                     }
                     .into_response();
@@ -195,7 +198,6 @@ pub(crate) mod diag_service {
             data_request::<T>(
                 DiagComm {
                     name: diag_service,
-                    action: DiagCommAction::Read,
                     type_: DiagCommType::Data,
                     lookup_name: None,
                 },
@@ -252,7 +254,6 @@ pub(crate) mod diag_service {
         data_request::<T>(
             DiagComm {
                 name: service.clone(),
-                action: DiagCommAction::Write,
                 type_: DiagCommType::Configurations,
                 lookup_name: None,
             },

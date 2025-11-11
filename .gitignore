@@ -1,9 +1,6 @@
 build
 /target
 
-# exclude all mdd files...
-**/*.mdd
-
 *.pcap*
 .idea
 .vscode/settings.json
@@ -13,3 +10,6 @@ build
 docs/images/*.svg
 
 **/*.html
+
+# Docker environment settings
+.env

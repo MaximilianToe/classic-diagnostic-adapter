@@ -20,9 +20,11 @@ members = [
   "cda-main",
   "cda-tracing",
   "cda-plugin-security",
+  "integration-tests",
 ]
 
 [workspace.dependencies]
+opensovd_cda_lib = { path = "cda-main", package = "opensovd-cda" }
 cda-interfaces = { path = "cda-interfaces" }
 cda-core = { path = "cda-core" }
 cda-comm-doip = { path = "cda-comm-doip" }
@@ -46,6 +48,7 @@ futures = "0.3"
 regex = "1.11.1"
 uuid = "1.16.0"
 prost = "0.14"
+flatbuffers = "25.9.23"
 xz2 = "0.1.6"
 hex = "0.4.3"
 strum = "0.27.2"
@@ -59,12 +62,17 @@ deepsize = "0.2.0"
 prost-build = "0.14.1"
 ctor = "0.1.23"
 reqwest = "0.12.22"
+url = "2.5.7"
 clap = "4.5"
 figment = "0.10.19"
 schemars = "1.0.4"
 aide = "0.15.0"
 doip-definitions = "3.0.13"
 doip-sockets = "0.2.4"
+ouroboros = "0.18.5"
+toml = "0.9.8"
+cargo_toml = "0.22.3"
+libc = "0.2.162"
 
 # ---- tracing & logging crates----
 tracing = "0.1.41"
@@ -116,3 +124,4 @@ schemars = { git = "https://github.com/theswiftfox/schemars.git", rev = "d264067
 aide = { git = "https://github.com/theswiftfox/aide.git", rev = "e533403" }
 doip-definitions = { git = "https://github.com/theswiftfox/doip-definitions.git", rev = "bdeab8c" }
 doip-sockets = { git = "https://github.com/theswiftfox/doip-sockets.git", rev = "0771453" }
+flatbuffers = { git = "https://github.com/alexmohr/flatbuffers.git", rev = "0ba3307d" }

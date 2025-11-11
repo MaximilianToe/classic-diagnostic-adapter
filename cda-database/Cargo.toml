@@ -11,6 +11,9 @@ description = "ECU Database for CDA"
 homepage.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 
@@ -20,6 +23,8 @@ cda-interfaces = { workspace = true }
 # external
 hashbrown = { workspace = true, features = ["serde"] }
 prost = { workspace = true }
+flatbuffers = { workspace = true }
+ouroboros = { workspace = true }
 # tokio
 tokio = { workspace = true, features = ["rt", "sync", "io-util", "time"] }
 # v4 - Version 4 UUIDs with random data.
@@ -38,8 +43,17 @@ serde_json = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }
+cargo_toml = { workspace = true }
+toml = { workspace = true }
 
 [features]
 default = []
 deepsize = ["dep:deepsize"]
 gen-protos = []
+gen-flatbuffers = []
+
+# Guard the database builder, as it should not be used
+# in production code because creating the database manually
+# via code is cumbersome and error-prone.
+# The feature primarily exists to support testing.
+database-builder = []

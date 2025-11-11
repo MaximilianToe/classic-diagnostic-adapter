@@ -11,9 +11,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cda_database::datatypes::{self, CompuMethod, CompuScale, DataType};
+use cda_database::datatypes::{self, DataType};
 use cda_interfaces::{
-    DataParseError, DiagServiceError, STRINGS,
+    DataParseError, DiagServiceError,
     util::{decode_hex, tracing::print_hex},
 };
 
@@ -25,8 +25,8 @@ use crate::diag_kernel::{
 };
 
 pub(in crate::diag_kernel) fn uds_data_to_serializable(
-    diag_type: DataType,
-    compu_method: Option<&CompuMethod>,
+    diag_type: datatypes::DataType,
+    compu_method: Option<&datatypes::CompuMethod>,
     is_negative_response: bool,
     data: &[u8],
 ) -> Result<DiagDataValue, DiagServiceError> {
@@ -57,7 +57,7 @@ pub(in crate::diag_kernel) fn uds_data_to_serializable(
 
 fn compu_lookup(
     diag_type: DataType,
-    compu_method: &CompuMethod,
+    compu_method: &datatypes::CompuMethod,
     category: datatypes::CompuCategory,
     is_negative_response: bool,
     data: &[u8],
@@ -90,7 +90,7 @@ fn compu_lookup(
                     let coeffs = scale.rational_coefficients.as_ref().unwrap();
                     let lookup_val: f64 = lookup.try_into()?;
                     let val = coeffs.numerator[0] + lookup_val * coeffs.numerator[1];
-                    DiagDataValue::from_number(val, diag_type)
+                    DiagDataValue::from_number(&val, diag_type)
                 } else {
                     Ok(lookup)
                 }
@@ -119,19 +119,15 @@ fn compu_lookup(
                 let coeffs = scale.rational_coefficients.as_ref().unwrap();
                 let lookup_val: f64 = lookup.try_into()?;
                 let val = lookup_val * coeffs.numerator[0] / coeffs.denominator[0];
-                DiagDataValue::from_number(val, diag_type)
+                DiagDataValue::from_number(&val, diag_type)
             }
             datatypes::CompuCategory::TextTable => {
                 let consts = scale.consts.as_ref().ok_or_else(|| {
                     DiagServiceError::InvalidDatabase("TextTable lookup has no Consts".to_owned())
                 })?;
-                let mapped_value = consts
-                    .vt
-                    .or(consts.vt_ti)
-                    .and_then(|v| STRINGS.get(v))
-                    .ok_or_else(|| {
-                        DiagServiceError::UdsLookupError("failed to read compu value".to_owned())
-                    })?;
+                let mapped_value = consts.vt.clone().or(consts.vt_ti.clone()).ok_or_else(|| {
+                    DiagServiceError::UdsLookupError("failed to read compu value".to_owned())
+                })?;
                 Ok(DiagDataValue::String(mapped_value))
             }
             _ => {
@@ -144,6 +140,8 @@ fn compu_lookup(
                 let lookup: u32 = lookup.try_into()?;
                 if lookup <= 0xFF {
                     Ok(DiagDataValue::String(
+                        // Okay because the NRC is defined as u8
+                        #[allow(clippy::cast_possible_truncation)]
                         iso_14229_nrc::get_nrc_code(lookup as u8).to_owned(),
                     ))
                 } else {
@@ -161,9 +159,12 @@ fn compu_lookup(
     }
 }
 
+// Casting and truncating is defined in the ISO instead of rounding
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
 fn compu_convert(
-    diag_type: DataType,
-    compu_method: &CompuMethod,
+    diag_type: datatypes::DataType,
+    compu_method: &datatypes::CompuMethod,
     category: datatypes::CompuCategory,
     value: &serde_json::Value,
 ) -> Result<Vec<u8>, DiagServiceError> {
@@ -175,7 +176,10 @@ fn compu_convert(
                 .scales
                 .first()
                 .map(|scale| {
-                    fn calculate<T>(input: f64, scale: &CompuScale) -> Result<f64, DiagServiceError>
+                    fn calculate<T>(
+                        input: f64,
+                        scale: &datatypes::CompuScale,
+                    ) -> Result<f64, DiagServiceError>
                     where
                         f64: From<T>,
                         T: std::str::FromStr,
@@ -260,8 +264,7 @@ fn compu_convert(
                     if let Some(text) = scale
                         .consts
                         .as_ref()
-                        .and_then(|consts| consts.vt.or(consts.vt_ti))
-                        .and_then(|text| STRINGS.get(text))
+                        .and_then(|consts| consts.vt.clone().or(consts.vt_ti.clone()))
                         && value == text
                     {
                         return scale.lower_limit.as_ref();
@@ -304,11 +307,11 @@ pub(in crate::diag_kernel) fn extract_diag_data_container(
     param: &datatypes::Parameter,
     payload: &mut Payload,
     diag_type: &datatypes::DiagCodedType,
-    compu_method: Option<&CompuMethod>,
+    compu_method: Option<datatypes::CompuMethod>,
 ) -> Result<DiagDataTypeContainer, DiagServiceError> {
-    let byte_pos = param.byte_pos as usize;
+    let byte_pos = param.byte_position() as usize;
     let uds_payload = payload.data();
-    let (data, bit_len) = diag_type.decode(uds_payload, byte_pos, param.bit_pos as usize)?;
+    let (data, bit_len) = diag_type.decode(uds_payload, byte_pos, param.bit_position() as usize)?;
 
     let data_type = diag_type.base_datatype();
     payload.set_last_read_byte_pos(byte_pos + data.len());
@@ -318,14 +321,14 @@ pub(in crate::diag_kernel) fn extract_diag_data_container(
             data,
             bit_len,
             data_type,
-            compu_method: compu_method.cloned(),
+            compu_method,
         },
     ))
 }
 
 pub(in crate::diag_kernel) fn json_value_to_uds_data(
-    diag_type: DataType,
-    compu_method: Option<&CompuMethod>,
+    diag_type: datatypes::DataType,
+    compu_method: Option<datatypes::CompuMethod>,
     json_value: &serde_json::Value,
 ) -> Result<Vec<u8>, DiagServiceError> {
     'compu: {
@@ -333,7 +336,7 @@ pub(in crate::diag_kernel) fn json_value_to_uds_data(
             match compu_method.category {
                 datatypes::CompuCategory::Identical => break 'compu,
                 category => {
-                    return compu_convert(diag_type, compu_method, category, json_value);
+                    return compu_convert(diag_type, &compu_method, category, json_value);
                 }
             }
         }
@@ -354,6 +357,9 @@ pub(in crate::diag_kernel) fn json_value_to_uds_data(
     }
 }
 
+// truncating values and sign loss is expected when converting float values into a vec<u8>
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_sign_loss)]
 pub(in crate::diag_kernel) fn string_to_vec_u8(
     data_type: DataType,
     value: &str,
@@ -364,8 +370,16 @@ pub(in crate::diag_kernel) fn string_to_vec_u8(
             if value.chars().all(char::is_numeric) {
                 match data_type {
                     DataType::ByteField => value
-                        .parse::<u8>()
-                        .map(|v| v.to_be_bytes().to_vec())
+                        .parse::<u64>()
+                        .map(|v| {
+                            let bytes = v.to_be_bytes();
+                            // Find the first non-zero byte, or keep at least one byte
+                            let start = bytes
+                                .iter()
+                                .position(|&b| b != 0)
+                                .unwrap_or(bytes.len() - 1);
+                            bytes[start..].to_vec()
+                        })
                         .map_err(|_| {
                             DiagServiceError::ParameterConversionError(
                                 "Invalid value type for ByteField".to_owned(),
@@ -460,7 +474,12 @@ fn json_value_to_byte_vector(
             )));
         }
 
-        Ok((value as i32).to_be_bytes().to_vec())
+        Ok(i32::try_from(value)
+            .map_err(|e| {
+                DiagServiceError::ParameterConversionError(format!("Failed to convert to i32 {e}"))
+            })?
+            .to_be_bytes()
+            .to_vec())
     }
 
     let data: Result<Vec<u8>, DiagServiceError> = if json_value.is_string() {
@@ -480,12 +499,15 @@ fn json_value_to_byte_vector(
                 i64::from(u32::MAX),
                 data_type,
             ),
-            DataType::Float32 => json_value
-                .as_f64()
-                .ok_or(DiagServiceError::ParameterConversionError(
-                    "Invalid value for Float32".to_owned(),
-                ))
-                .map(|v| (v as f32).to_be_bytes().to_vec()),
+            DataType::Float32 => {
+                #[allow(clippy::cast_possible_truncation)] // truncating f64 to f32 is intended here
+                json_value
+                    .as_f64()
+                    .ok_or(DiagServiceError::ParameterConversionError(
+                        "Invalid value for Float32".to_owned(),
+                    ))
+                    .map(|v| (v as f32).to_be_bytes().to_vec())
+            }
             DataType::Float64 => json_value
                 .as_f64()
                 .ok_or(DiagServiceError::ParameterConversionError(
@@ -625,10 +647,10 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_byte_value() {
+    fn test_long_byte_value() {
         let json_value = serde_json::json!("256");
         let result = super::json_value_to_uds_data(DataType::ByteField, None, &json_value);
-        assert!(result.is_err());
+        assert_eq!(result, Ok(vec![0x01, 0x00]));
     }
 
     #[test]
@@ -798,7 +820,7 @@ mod tests {
             rational_coefficients: None,
             consts: Some(CompuValues {
                 v: 0.0,
-                vt: Some(cda_interfaces::STRINGS.get_or_insert("TestValue")),
+                vt: Some("TestValue".to_owned()),
                 vt_ti: None,
             }),
             lower_limit: Some(Limit {
